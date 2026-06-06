@@ -1,6 +1,6 @@
 {
   "name": "omp-codex-lb-responses",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "private": false,
   "description": "OMP custom API provider for Codex-compatible load-balanced websocket backends.",
@@ -27,6 +27,7 @@
   },
   "dependencies": {
     "@oh-my-pi/pi-ai": ">=15.9.5 <16",
+    "@oh-my-pi/pi-utils": ">=15.9.5 <16",
     "yaml": "^2.8.1"
   }
 }

@@ -1,8 +1,8 @@
-import { existsSync, readFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { homedir } from "node:os";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { modelOmitsReasoningEffort, requireSupportedEffort, streamOpenAICodexResponses } from "@oh-my-pi/pi-ai";
+import { getAgentDir as getOmpAgentDir } from "@oh-my-pi/pi-utils/dirs";
 import type {
 	AssistantMessageEventStream,
 	Context,
@@ -10,6 +10,7 @@ import type {
 	Model,
 	OpenAICodexResponsesOptions,
 	ProviderSessionState,
+	ServiceTier,
 	SimpleStreamOptions,
 	ToolChoice,
 } from "@oh-my-pi/pi-ai";
@@ -17,8 +18,9 @@ import { parse as parseYaml } from "yaml";
 
 const CODEX_LB_API = "codex-lb-responses";
 const INNER_CODEX_API = "openai-codex-responses";
-const REAL_TOKEN_HEADER = "x-omp-codex-lb-token";
+const LEGACY_REAL_TOKEN_HEADER = "x-omp-codex-lb-token";
 const SHIM_KEY = Symbol.for("omp.codex-lb-responses.transport-shim");
+const TOKEN_FINGERPRINT_BYTES = 16;
 const DEFAULT_CONTEXT_WINDOW = 272000;
 const DEFAULT_MAX_TOKENS = 128000;
 const DEFAULT_COST = { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 };
@@ -37,6 +39,7 @@ type ExtensionApi = {
 		headers?: Record<string, string>;
 		authHeader?: boolean;
 		models?: Array<Record<string, unknown>>;
+		compat?: Record<string, unknown>;
 	}) => void;
 };
 
@@ -58,6 +61,7 @@ type RawProvider = {
 	headers?: unknown;
 	authHeader?: unknown;
 	models?: unknown;
+	compat?: unknown;
 };
 type ModelsConfig = { providers?: Record<string, RawProvider> };
 type ShimState = {
@@ -84,13 +88,20 @@ function createFakeCodexJwt(accountId: string): string {
 	return `${header}.${payload}.codexlb`;
 }
 
-function createFakeAccountId(providerName: string, baseUrl: string): string {
-	const hash = createHash("sha256").update(`${providerName}\0${baseUrl}`).digest("base64url").slice(0, 12);
+function createFakeAccountId(providerName: string, baseUrl: string, realApiKey: string): string {
+	const hash = createHash("sha256")
+		.update(`${providerName}\0${baseUrl}\0${realApiKey}`)
+		.digest("base64url")
+		.slice(0, TOKEN_FINGERPRINT_BYTES);
 	return `codex-lb-${hash}`;
 }
 
+function createFakeApiKey(providerName: string, baseUrl: string, realApiKey: string): string {
+	return createFakeCodexJwt(createFakeAccountId(providerName, baseUrl, realApiKey));
+}
+
 function getAgentDir(): string {
-	return process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".omp", "agent");
+	return getOmpAgentDir();
 }
 
 function readModelsConfig(): ModelsConfig | undefined {
@@ -125,6 +136,10 @@ function asHeaders(value: unknown): Record<string, string> | undefined {
 		if (typeof headerValue === "string") out[key] = headerValue;
 	}
 	return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function asPlainRecord(value: unknown): Record<string, unknown> | undefined {
+	return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
 function resolveConfiguredApiKey(apiKey: string): string {
@@ -220,6 +235,7 @@ function discoverCodexLbProviders(): Array<{
 	headers?: Record<string, string>;
 	authHeader?: boolean;
 	models: Array<Record<string, unknown>>;
+	compat?: Record<string, unknown>;
 }> {
 	const providers = readModelsConfig()?.providers;
 	if (!providers) return [];
@@ -233,14 +249,16 @@ function discoverCodexLbProviders(): Array<{
 		const apiKey = asNonEmptyString(provider.apiKey);
 		if (!baseUrl || !apiKey || models.length === 0) continue;
 		const realApiKey = resolveConfiguredApiKey(apiKey);
+		const fakeApiKey = createFakeApiKey(name, baseUrl, realApiKey);
 		discovered.push({
 			name,
 			baseUrl,
 			realApiKey,
-			fakeApiKey: createFakeCodexJwt(createFakeAccountId(name, baseUrl)),
+			fakeApiKey,
 			headers: asHeaders(provider.headers),
 			authHeader: typeof provider.authHeader === "boolean" ? provider.authHeader : undefined,
 			models,
+			compat: asPlainRecord(provider.compat),
 		});
 	}
 	return discovered;
@@ -249,16 +267,14 @@ function discoverCodexLbProviders(): Array<{
 function rewriteCodexLbHeaders(init: HeadersInit | undefined): HeadersInit | undefined {
 	if (!init) return init;
 	const headers = new Headers(init);
-	const privateToken = headers.get(REAL_TOKEN_HEADER);
 	const authorization = headers.get("authorization") ?? headers.get("Authorization");
 	const bearerToken = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : undefined;
-	const mappedToken = bearerToken ? getShimState().tokens.get(bearerToken) : undefined;
-	const realToken = privateToken ?? mappedToken;
+	const realToken = bearerToken ? getShimState().tokens.get(bearerToken) : undefined;
 	if (!realToken) return init;
 
 	headers.set("Authorization", `Bearer ${realToken}`);
 	headers.delete("chatgpt-account-id");
-	headers.delete(REAL_TOKEN_HEADER);
+	headers.delete(LEGACY_REAL_TOKEN_HEADER);
 	return headers;
 }
 
@@ -330,6 +346,10 @@ function resolveRealApiKey(apiKey: string): string {
 	return getShimState().tokens.get(apiKey) ?? apiKey;
 }
 
+function resolveServiceTierForCodexLb(serviceTier: ServiceTier | undefined): ServiceTier | undefined {
+	return serviceTier === "openai-only" ? "priority" : serviceTier;
+}
+
 function resolveCodexReasoning(
 	model: Model<"openai-codex-responses">,
 	options: CodexLbStreamOptions | undefined,
@@ -399,38 +419,38 @@ function mapCodexOptions(
 	const temporaryProviderSessionState = generatedSessionId ? new Map<string, ProviderSessionState>() : undefined;
 	return {
 		options: {
-		temperature: codexOptions?.temperature,
-		topP: codexOptions?.topP,
-		topK: codexOptions?.topK,
-		minP: codexOptions?.minP,
-		presencePenalty: codexOptions?.presencePenalty,
-		repetitionPenalty: codexOptions?.repetitionPenalty,
-		maxTokens: codexOptions?.maxTokens ?? model.maxTokens,
-		signal: codexOptions?.signal,
-		apiKey: createFakeCodexJwt(createFakeAccountId(model.provider, model.baseUrl ?? "")),
-		cacheRetention: codexOptions?.cacheRetention,
-		headers: { ...(codexOptions?.headers ?? {}), [REAL_TOKEN_HEADER]: realApiKey },
-		initiatorOverride: codexOptions?.initiatorOverride,
-		maxRetryDelayMs: codexOptions?.maxRetryDelayMs,
-		metadata: codexOptions?.metadata,
-		taskBudget: codexOptions?.taskBudget,
-		sessionId: codexOptions?.sessionId ?? generatedSessionId,
-		promptCacheKey: codexOptions?.promptCacheKey,
-		streamFirstEventTimeoutMs: codexOptions?.streamFirstEventTimeoutMs,
-		streamIdleTimeoutMs: codexOptions?.streamIdleTimeoutMs,
+			temperature: codexOptions?.temperature,
+			topP: codexOptions?.topP,
+			topK: codexOptions?.topK,
+			minP: codexOptions?.minP,
+			presencePenalty: codexOptions?.presencePenalty,
+			repetitionPenalty: codexOptions?.repetitionPenalty,
+			maxTokens: codexOptions?.maxTokens ?? model.maxTokens,
+			signal: codexOptions?.signal,
+			apiKey: createFakeApiKey(model.provider, model.baseUrl ?? "", realApiKey),
+			cacheRetention: codexOptions?.cacheRetention,
+			headers: codexOptions?.headers,
+			initiatorOverride: codexOptions?.initiatorOverride,
+			maxRetryDelayMs: codexOptions?.maxRetryDelayMs,
+			metadata: codexOptions?.metadata,
+			taskBudget: codexOptions?.taskBudget,
+			sessionId: codexOptions?.sessionId ?? generatedSessionId,
+			promptCacheKey: codexOptions?.promptCacheKey,
+			streamFirstEventTimeoutMs: codexOptions?.streamFirstEventTimeoutMs,
+			streamIdleTimeoutMs: codexOptions?.streamIdleTimeoutMs,
 			providerSessionState: temporaryProviderSessionState ?? codexOptions?.providerSessionState,
-		onPayload: mapCodexOnPayload(codexOptions),
-		onResponse: codexOptions?.onResponse,
-		onSseEvent: codexOptions?.onSseEvent,
-		execHandlers: codexOptions?.execHandlers,
-		fetch: createCodexLbFetch(codexOptions?.fetch),
-		include: codexOptions?.include,
-		reasoning: resolveCodexReasoning(model, codexOptions),
-		reasoningSummary: codexOptions?.hideThinkingSummary ? null : codexOptions?.reasoningSummary,
-		textVerbosity: codexOptions?.textVerbosity,
-		toolChoice: mapCodexToolChoice(codexOptions?.toolChoice),
-		serviceTier: codexOptions?.serviceTier,
-		preferWebsockets: codexOptions?.preferWebsockets ?? (generatedSessionId ? true : undefined),
+			onPayload: mapCodexOnPayload(codexOptions),
+			onResponse: codexOptions?.onResponse,
+			onSseEvent: codexOptions?.onSseEvent,
+			execHandlers: codexOptions?.execHandlers,
+			fetch: createCodexLbFetch(codexOptions?.fetch),
+			include: codexOptions?.include,
+			reasoning: resolveCodexReasoning(model, codexOptions),
+			reasoningSummary: codexOptions?.hideThinkingSummary ? null : codexOptions?.reasoningSummary,
+			textVerbosity: codexOptions?.textVerbosity,
+			toolChoice: mapCodexToolChoice(codexOptions?.toolChoice),
+			serviceTier: resolveServiceTierForCodexLb(codexOptions?.serviceTier),
+			preferWebsockets: codexOptions?.preferWebsockets ?? (generatedSessionId ? true : undefined),
 		},
 		temporaryProviderSessionState,
 	};
@@ -452,7 +472,7 @@ function streamCodexLbResponses(
 	const innerModel = {
 		...model,
 		api: INNER_CODEX_API,
-		headers: { ...(model.headers ?? {}), [REAL_TOKEN_HEADER]: realApiKey },
+		headers: model.headers,
 	} as Model<"openai-codex-responses">;
 	const { options: innerOptions, temporaryProviderSessionState } = mapCodexOptions(innerModel, options, realApiKey);
 
@@ -485,6 +505,7 @@ export default function codexLbResponses(pi: ExtensionApi): void {
 			authHeader: provider.authHeader,
 			api: CODEX_LB_API,
 			models: provider.models,
+			compat: provider.compat,
 			streamSimple: streamCodexLbResponses,
 		});
 	}

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, test } from "bun:test";
 import type { AssistantMessageEventStream, Context, Model, ProviderSessionState, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils/dirs";
 import codexLbResponses from "./index";
 
 type StreamSimple = (model: Model, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream;
@@ -11,7 +12,7 @@ const CAPTURED = new Error("payload captured");
 let streamSimple: StreamSimple | undefined;
 
 beforeAll(() => {
-	process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "codex-lb-test-"));
+	setAgentDir(mkdtempSync(join(tmpdir(), "codex-lb-test-")));
 	codexLbResponses({
 		registerProvider(name, config) {
 			if (name === "codex-lb-responses") streamSimple = config.streamSimple;
@@ -64,18 +65,19 @@ async function captureHeadersForDiscoveredProvider(): Promise<Headers> {
 	const agentDir = mkdtempSync(join(tmpdir(), "codex-lb-discovered-"));
 	writeFileSync(
 		join(agentDir, "models.yml"),
-		`providers:\n  codex-lb:\n    baseUrl: https://lb.example/backend-api/codex\n    apiKey: sk-real-token\n    api: openai-codex-responses\n    models:\n      - id: gpt-5\n        name: gpt-5\n        reasoning: true\n`,
+		`providers:\n  codex-lb:\n    baseUrl: https://lb.example/backend-api/codex\n    apiKey: sk-real-token\n    api: openai-codex-responses\n    compat:\n      supportsReasoningEffort: false\n    models:\n      - id: gpt-5\n        name: gpt-5\n        reasoning: true\n`,
 	);
-	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-	process.env.PI_CODING_AGENT_DIR = agentDir;
-	let providerConfig: { apiKey?: string; streamSimple?: StreamSimple; models?: Array<Record<string, unknown>> } | undefined;
+	const previousAgentDir = getAgentDir();
+	setAgentDir(agentDir);
+	let providerConfig: { apiKey?: string; streamSimple?: StreamSimple; models?: Array<Record<string, unknown>>; compat?: Record<string, unknown> } | undefined;
 	codexLbResponses({
 		registerProvider(name, config) {
 			if (name === "codex-lb") providerConfig = config;
 		},
 	});
-	process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+	setAgentDir(previousAgentDir);
 	expect(providerConfig.models?.[0]?.api).toBe("codex-lb-responses");
+	expect(providerConfig.compat?.supportsReasoningEffort).toBe(false);
 	if (!providerConfig?.apiKey || !providerConfig.streamSimple) throw new Error("codex-lb provider was not registered");
 
 	let headers = new Headers();
@@ -148,6 +150,12 @@ describe("Codex LB utility request options", () => {
 		expect(payload.tool_choice).toBe("required");
 	});
 
+	test("maps scoped OpenAI service tier to Codex priority", async () => {
+		const payload = await capturePayload({ serviceTier: "openai-only" });
+
+		expect(payload.service_tier).toBe("priority");
+	});
+
 	test("keeps generated utility sessions out of caller provider state", async () => {
 		const providerSessionState = new Map<string, ProviderSessionState>();
 		const stream = streamSimple!(createModel(), context, {
@@ -166,9 +174,31 @@ describe("Codex LB utility request options", () => {
 		expect(providerSessionState.size).toBe(0);
 	});
 
-	test("rewrites discovered provider fake key to real bearer", async () => {
+	test("rewrites discovered provider fake key to real bearer without private token headers", async () => {
 		const headers = await captureHeadersForDiscoveredProvider();
 		expect(headers.get("authorization")).toBe("Bearer sk-real-token");
 		expect(headers.has("chatgpt-account-id")).toBe(false);
+		expect(headers.has("x-omp-codex-lb-token")).toBe(false);
+	});
+
+	test("keys fake Codex auth by the real bearer", () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "codex-lb-rotated-"));
+		writeFileSync(
+			join(agentDir, "models.yml"),
+			`providers:\n  codex-a:\n    baseUrl: https://lb.example/backend-api/codex\n    apiKey: sk-one\n    api: openai-codex-responses\n    models:\n      - id: gpt-5\n  codex-b:\n    baseUrl: https://lb.example/backend-api/codex\n    apiKey: sk-two\n    api: openai-codex-responses\n    models:\n      - id: gpt-5\n`,
+		);
+		const previousAgentDir = getAgentDir();
+		setAgentDir(agentDir);
+		const apiKeys: Record<string, string> = {};
+		codexLbResponses({
+			registerProvider(name, config) {
+				if (config.apiKey) apiKeys[name] = config.apiKey;
+			},
+		});
+		setAgentDir(previousAgentDir);
+
+		expect(apiKeys["codex-a"]).toBeDefined();
+		expect(apiKeys["codex-b"]).toBeDefined();
+		expect(apiKeys["codex-a"]).not.toBe(apiKeys["codex-b"]);
 	});
 });

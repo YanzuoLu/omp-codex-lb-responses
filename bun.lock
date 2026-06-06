@@ -6,6 +6,7 @@
       "name": "omp-codex-lb-responses",
       "dependencies": {
         "@oh-my-pi/pi-ai": ">=15.9.5 <16",
+        "@oh-my-pi/pi-utils": ">=15.9.5 <16",
         "yaml": "^2.8.1",
       },
     },
