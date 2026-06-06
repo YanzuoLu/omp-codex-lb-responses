@@ -1,9 +1,17 @@
 import { existsSync, readFileSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { streamOpenAICodexResponses } from "@oh-my-pi/pi-ai";
-import type { AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import { modelOmitsReasoningEffort, requireSupportedEffort, streamOpenAICodexResponses } from "@oh-my-pi/pi-ai";
+import type {
+	AssistantMessageEventStream,
+	Context,
+	Effort,
+	Model,
+	OpenAICodexResponsesOptions,
+	SimpleStreamOptions,
+	ToolChoice,
+} from "@oh-my-pi/pi-ai";
 import { parse as parseYaml } from "yaml";
 
 const CODEX_LB_API = "codex-lb-responses";
@@ -314,12 +322,111 @@ function installCodexLbTransportShims(): void {
 	installCodexLbWebSocketShim();
 }
 
+type CodexLbStreamOptions = Omit<SimpleStreamOptions, "reasoning"> &
+	Pick<OpenAICodexResponsesOptions, "include" | "reasoning" | "reasoningSummary" | "textVerbosity">;
+
+function resolveRealApiKey(apiKey: string): string {
+	return getShimState().tokens.get(apiKey) ?? apiKey;
+}
+
+function resolveCodexReasoning(
+	model: Model<"openai-codex-responses">,
+	options: CodexLbStreamOptions | undefined,
+): OpenAICodexResponsesOptions["reasoning"] {
+	if (!options || !model.reasoning) return undefined;
+	if (options.disableReasoning || options.reasoning === "none") return "none";
+	if (!options.reasoning || modelOmitsReasoningEffort(model)) return undefined;
+	return requireSupportedEffort(model, options.reasoning as Effort) as OpenAICodexResponsesOptions["reasoning"];
+}
+
+function mapCodexToolChoice(choice: ToolChoice | undefined): ToolChoice | undefined {
+	if (!choice) return undefined;
+	if (typeof choice === "string") {
+		if (choice === "any") return "required";
+		if (choice === "auto" || choice === "none" || choice === "required") return choice;
+		return undefined;
+	}
+	if (choice.type === "tool") {
+		return choice.name ? { type: "function", function: { name: choice.name } } : undefined;
+	}
+	if (choice.type === "function") {
+		const name = "function" in choice ? choice.function?.name : choice.name;
+		return name ? { type: "function", function: { name } } : undefined;
+	}
+	return undefined;
+}
+
+function omitCodexReasoningSummary(payload: unknown): void {
+	if (!payload || typeof payload !== "object") return;
+	const reasoning = (payload as { reasoning?: unknown }).reasoning;
+	if (!reasoning || typeof reasoning !== "object") return;
+	delete (reasoning as { summary?: unknown }).summary;
+}
+
+function mapCodexOnPayload(
+	options: CodexLbStreamOptions | undefined,
+): OpenAICodexResponsesOptions["onPayload"] {
+	if (!options?.hideThinkingSummary) return options?.onPayload;
+	return (payload, model) => {
+		omitCodexReasoningSummary(payload);
+		return options.onPayload?.(payload, model);
+	};
+}
+
+function needsCodexUtilitySession(options: CodexLbStreamOptions | undefined): boolean {
+	return Boolean(options && !options.sessionId && (options.disableReasoning || options.toolChoice !== undefined));
+}
+
+function mapCodexOptions(
+	model: Model<"openai-codex-responses">,
+	options: SimpleStreamOptions | undefined,
+	realApiKey: string,
+): OpenAICodexResponsesOptions {
+	const codexOptions = options as CodexLbStreamOptions | undefined;
+	const generatedSessionId = needsCodexUtilitySession(codexOptions) ? randomUUID() : undefined;
+	return {
+		temperature: codexOptions?.temperature,
+		topP: codexOptions?.topP,
+		topK: codexOptions?.topK,
+		minP: codexOptions?.minP,
+		presencePenalty: codexOptions?.presencePenalty,
+		repetitionPenalty: codexOptions?.repetitionPenalty,
+		maxTokens: codexOptions?.maxTokens ?? model.maxTokens,
+		signal: codexOptions?.signal,
+		apiKey: createFakeCodexJwt(createFakeAccountId(model.provider, model.baseUrl ?? "")),
+		cacheRetention: codexOptions?.cacheRetention,
+		headers: { ...(codexOptions?.headers ?? {}), [REAL_TOKEN_HEADER]: realApiKey },
+		initiatorOverride: codexOptions?.initiatorOverride,
+		maxRetryDelayMs: codexOptions?.maxRetryDelayMs,
+		metadata: codexOptions?.metadata,
+		taskBudget: codexOptions?.taskBudget,
+		sessionId: codexOptions?.sessionId ?? generatedSessionId,
+		promptCacheKey: codexOptions?.promptCacheKey,
+		streamFirstEventTimeoutMs: codexOptions?.streamFirstEventTimeoutMs,
+		streamIdleTimeoutMs: codexOptions?.streamIdleTimeoutMs,
+		providerSessionState: codexOptions?.providerSessionState ?? (generatedSessionId ? new Map() : undefined),
+		onPayload: mapCodexOnPayload(codexOptions),
+		onResponse: codexOptions?.onResponse,
+		onSseEvent: codexOptions?.onSseEvent,
+		execHandlers: codexOptions?.execHandlers,
+		fetch: createCodexLbFetch(codexOptions?.fetch),
+		include: codexOptions?.include,
+		reasoning: resolveCodexReasoning(model, codexOptions),
+		reasoningSummary: codexOptions?.hideThinkingSummary ? null : codexOptions?.reasoningSummary,
+		textVerbosity: codexOptions?.textVerbosity,
+		toolChoice: mapCodexToolChoice(codexOptions?.toolChoice),
+		serviceTier: codexOptions?.serviceTier,
+		preferWebsockets: codexOptions?.preferWebsockets ?? (generatedSessionId ? true : undefined),
+	};
+}
+
 function streamCodexLbResponses(
 	model: Model,
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
-	const realApiKey = options?.apiKey;
+	const apiKey = options?.apiKey;
+	const realApiKey = apiKey ? resolveRealApiKey(apiKey) : undefined;
 	if (!realApiKey || realApiKey === "N/A") {
 		throw new Error(`No API key for provider: ${model.provider}`);
 	}
@@ -331,12 +438,7 @@ function streamCodexLbResponses(
 		api: INNER_CODEX_API,
 		headers: { ...(model.headers ?? {}), [REAL_TOKEN_HEADER]: realApiKey },
 	} as Model<"openai-codex-responses">;
-	const innerOptions = {
-		...options,
-		apiKey: createFakeCodexJwt(createFakeAccountId(model.provider, model.baseUrl ?? "")),
-		fetch: createCodexLbFetch(options?.fetch),
-		headers: { ...(options?.headers ?? {}), [REAL_TOKEN_HEADER]: realApiKey },
-	};
+	const innerOptions = mapCodexOptions(innerModel, options, realApiKey);
 
 	getShimState().tokens.set(innerOptions.apiKey, realApiKey);
 	return streamOpenAICodexResponses(innerModel, context, innerOptions);
@@ -362,6 +464,7 @@ export default function codexLbResponses(pi: ExtensionApi): void {
 			headers: provider.headers,
 			authHeader: provider.authHeader,
 			api: CODEX_LB_API,
+			models: provider.models,
 			streamSimple: streamCodexLbResponses,
 		});
 	}
