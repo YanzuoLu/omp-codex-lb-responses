@@ -31,7 +31,7 @@ type ExtensionApi = {
 		baseUrl?: string;
 		apiKey?: string;
 		api: string;
-		streamSimple: (
+		streamSimple?: (
 			model: Model,
 			context: Context,
 			options?: SimpleStreamOptions,
@@ -212,7 +212,7 @@ function normalizeModel(model: RawModel): Record<string, unknown> | undefined {
 		...model,
 		id,
 		name: asNonEmptyString(model.name) ?? id,
-		api: CODEX_LB_API,
+		api: INNER_CODEX_API,
 		reasoning: typeof model.reasoning === "boolean" ? model.reasoning : true,
 		input: input.length > 0 ? input : ["text"],
 		contextWindow: asPositiveNumber(model.contextWindow, DEFAULT_CONTEXT_WINDOW),
@@ -311,6 +311,7 @@ function createCodexLbFetch(fetchOverride: typeof fetch | undefined): typeof fet
 	}
 	return lbFetch;
 }
+
 
 function installCodexLbWebSocketShim(): void {
 	const state = getShimState();
@@ -487,26 +488,21 @@ function streamCodexLbResponses(
 export default function codexLbResponses(pi: ExtensionApi): void {
 	pi.setLabel?.("Codex LB Responses");
 	installCodexLbTransportShims();
-	const providers = discoverCodexLbProviders();
-	if (providers.length === 0) {
-		pi.registerProvider(CODEX_LB_API, {
-			api: CODEX_LB_API,
-			streamSimple: streamCodexLbResponses,
-		});
-		return;
-	}
+	pi.registerProvider(CODEX_LB_API, {
+		api: CODEX_LB_API,
+		streamSimple: streamCodexLbResponses,
+	});
 
-	for (const provider of providers) {
+	for (const provider of discoverCodexLbProviders()) {
 		getShimState().tokens.set(provider.fakeApiKey, provider.realApiKey);
 		pi.registerProvider(provider.name, {
 			baseUrl: provider.baseUrl,
 			apiKey: provider.fakeApiKey,
 			headers: provider.headers,
 			authHeader: provider.authHeader,
-			api: CODEX_LB_API,
+			api: INNER_CODEX_API,
 			models: provider.models,
 			compat: provider.compat,
-			streamSimple: streamCodexLbResponses,
 		});
 	}
 }

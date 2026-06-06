@@ -61,38 +61,75 @@ async function capturePayload(
 	return payload as Record<string, unknown>;
 }
 
-async function captureHeadersForDiscoveredProvider(): Promise<Headers> {
+async function captureDiscoveredProviderHeaders(): Promise<{
+	headers: Headers;
+	providerConfig: {
+		api?: string;
+		apiKey?: string;
+		streamSimple?: StreamSimple;
+		models?: Array<Record<string, unknown>>;
+		compat?: Record<string, unknown>;
+	};
+}> {
 	const agentDir = mkdtempSync(join(tmpdir(), "codex-lb-discovered-"));
 	writeFileSync(
 		join(agentDir, "models.yml"),
 		`providers:\n  codex-lb:\n    baseUrl: https://lb.example/backend-api/codex\n    apiKey: sk-real-token\n    api: openai-codex-responses\n    compat:\n      supportsReasoningEffort: false\n    models:\n      - id: gpt-5\n        name: gpt-5\n        reasoning: true\n`,
 	);
 	const previousAgentDir = getAgentDir();
-	setAgentDir(agentDir);
-	let providerConfig: { apiKey?: string; streamSimple?: StreamSimple; models?: Array<Record<string, unknown>>; compat?: Record<string, unknown> } | undefined;
-	codexLbResponses({
-		registerProvider(name, config) {
-			if (name === "codex-lb") providerConfig = config;
-		},
-	});
-	setAgentDir(previousAgentDir);
-	expect(providerConfig.models?.[0]?.api).toBe("codex-lb-responses");
-	expect(providerConfig.compat?.supportsReasoningEffort).toBe(false);
-	if (!providerConfig?.apiKey || !providerConfig.streamSimple) throw new Error("codex-lb provider was not registered");
-
+	const originalWebSocket = globalThis.WebSocket;
+	const shimState = (globalThis as typeof globalThis & Record<symbol, { webSocketInstalled?: boolean } | undefined>)[
+		Symbol.for("omp.codex-lb-responses.transport-shim")
+	];
+	let providerConfig:
+		| {
+				api?: string;
+				apiKey?: string;
+				streamSimple?: StreamSimple;
+				models?: Array<Record<string, unknown>>;
+				compat?: Record<string, unknown>;
+			}
+		| undefined;
 	let headers = new Headers();
-	const stream = providerConfig.streamSimple(createModel(), context, {
-		apiKey: providerConfig.apiKey,
-		fetch: async (_input, init) => {
-			headers = new Headers(init?.headers);
-			return new Response(JSON.stringify({ error: { message: "stop" } }), {
-				status: 401,
-				headers: { "content-type": "application/json" },
-			});
-		},
-	});
-	await stream.result();
-	return headers;
+	class CapturingWebSocket {
+		static CONNECTING = 0;
+		static OPEN = 1;
+		readyState = CapturingWebSocket.OPEN;
+		binaryType = "";
+
+		constructor(_url: string, options?: { headers?: HeadersInit }) {
+			headers = new Headers(options?.headers);
+		}
+
+		send() {}
+		close() {}
+		ping() {}
+	}
+
+	try {
+		setAgentDir(agentDir);
+		globalThis.WebSocket = CapturingWebSocket as typeof WebSocket;
+		if (shimState) shimState.webSocketInstalled = false;
+		codexLbResponses({
+			registerProvider(name, config) {
+				if (name === "codex-lb") providerConfig = config;
+			},
+		});
+		if (!providerConfig?.apiKey) throw new Error("codex-lb provider was not registered");
+		new WebSocket("wss://lb.example/backend-api/codex/responses", {
+			headers: new Headers([
+				["authorization", `Bearer ${providerConfig.apiKey}`],
+				["chatgpt-account-id", "fake-account"],
+				["x-omp-codex-lb-token", "legacy-real-token"],
+			]),
+		} as unknown as string[]);
+	} finally {
+		setAgentDir(previousAgentDir);
+		globalThis.WebSocket = originalWebSocket;
+		if (shimState) shimState.webSocketInstalled = false;
+	}
+
+	return { headers, providerConfig };
 }
 
 describe("Codex LB utility request options", () => {
@@ -174,8 +211,17 @@ describe("Codex LB utility request options", () => {
 		expect(providerSessionState.size).toBe(0);
 	});
 
+	test("keeps discovered providers on the built-in Codex API for core lifecycle", async () => {
+		const { providerConfig } = await captureDiscoveredProviderHeaders();
+
+		expect(providerConfig.api).toBe("openai-codex-responses");
+		expect(providerConfig.streamSimple).toBeUndefined();
+		expect(providerConfig.models?.[0]?.api).toBe("openai-codex-responses");
+		expect(providerConfig.compat?.supportsReasoningEffort).toBe(false);
+	});
+
 	test("rewrites discovered provider fake key to real bearer without private token headers", async () => {
-		const headers = await captureHeadersForDiscoveredProvider();
+		const { headers } = await captureDiscoveredProviderHeaders();
 		expect(headers.get("authorization")).toBe("Bearer sk-real-token");
 		expect(headers.has("chatgpt-account-id")).toBe(false);
 		expect(headers.has("x-omp-codex-lb-token")).toBe(false);

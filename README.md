@@ -47,12 +47,17 @@ A provider is eligible when:
 - it has a non-official `baseUrl`
 - it has an opaque token that does not contain a ChatGPT Codex `accountId`
 
-To force Codex websocket transport, set this in `~/.omp/agent/config.yml`:
+Set this in `~/.omp/agent/config.yml` to enable Codex WebSocket transport:
 
 ```yaml
 providers:
   openaiWebsockets: "on"
 ```
+
+For discovered `models.yml` providers, this plugin keeps the model API as `openai-codex-responses` so OMP core still runs its Codex lifecycle hooks: WebSocket prewarm, transport status, and provider-session cleanup. The plugin only swaps the opaque token into the actual fetch/WebSocket request.
+
+If WebSocket fails, OMP can still fall back to Codex Responses SSE (`text/event-stream`). SSE is the same Codex Responses protocol over HTTP streaming, not OpenAI chat/completions.
+
 
 ## Verify
 

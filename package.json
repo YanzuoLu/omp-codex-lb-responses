@@ -1,9 +1,9 @@
 {
   "name": "omp-codex-lb-responses",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "type": "module",
   "private": false,
-  "description": "OMP custom API provider for Codex-compatible load-balanced websocket backends.",
+  "description": "OMP auth shim for Codex-compatible load-balanced websocket backends.",
   "license": "MIT",
   "repository": {
     "type": "git",
