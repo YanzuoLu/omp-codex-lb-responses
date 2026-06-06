@@ -5,6 +5,21 @@
   "private": false,
   "description": "OMP custom API provider for Codex-compatible load-balanced websocket backends.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YanzuoLu/omp-codex-lb-responses.git"
+  },
+  "homepage": "https://github.com/YanzuoLu/omp-codex-lb-responses#readme",
+  "bugs": {
+    "url": "https://github.com/YanzuoLu/omp-codex-lb-responses/issues"
+  },
+  "keywords": [
+    "omp",
+    "oh-my-pi",
+    "codex",
+    "websocket",
+    "responses"
+  ],
   "omp": {
     "name": "Codex LB Responses",
     "description": "Registers api: codex-lb-responses for opaque-token Codex-compatible backends.",
