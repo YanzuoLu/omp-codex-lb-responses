@@ -1,6 +1,6 @@
 {
   "name": "omp-codex-lb-responses",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "private": false,
   "description": "OMP custom API provider for Codex-compatible load-balanced websocket backends.",
@@ -22,7 +22,7 @@
   ],
   "omp": {
     "name": "Codex LB Responses",
-    "description": "Registers api: codex-lb-responses for eligible Codex-compatible providers declared in models.yml.",
+    "description": "Installs an auth shim for eligible Codex-compatible providers declared in models.yml.",
     "extensions": ["src/index.ts"]
   },
   "dependencies": {

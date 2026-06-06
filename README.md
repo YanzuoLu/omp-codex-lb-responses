@@ -1,6 +1,6 @@
 # omp-codex-lb-responses
 
-OMP plugin that enables Codex-compatible load-balanced backends using opaque bearer tokens such as `sk-clb-...`.
+OMP plugin for Codex-compatible load-balanced backends that use opaque bearer tokens such as `sk-clb-...`.
 
 Use this when your backend speaks the OpenAI Codex Responses protocol, but is not the official `https://chatgpt.com/backend-api/codex/responses` endpoint and cannot provide a ChatGPT `accountId` from the bearer token.
 
@@ -20,7 +20,7 @@ omp plugin list
 
 Keep provider/model/baseUrl/apiKey in `~/.omp/agent/models.yml`.
 
-Important: write the schema-valid API name `openai-codex-responses`, not `codex-lb-responses`. OMP validates `models.yml` before plugins load, so custom plugin API names cannot appear directly in that file.
+Write the schema-valid API name `openai-codex-responses`, not `codex-lb-responses`. OMP validates `models.yml` before plugins load, so custom plugin API names cannot appear directly in that file.
 
 ```yaml
 providers:
@@ -39,7 +39,7 @@ providers:
         cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 }
 ```
 
-At runtime, this plugin detects eligible providers and re-registers them with the custom API `codex-lb-responses`.
+At runtime, this plugin detects eligible providers and installs an auth shim for them.
 
 A provider is eligible when:
 
@@ -71,12 +71,13 @@ omp --smoke-test
 ## What this plugin does
 
 - Scans `~/.omp/agent/models.yml` for eligible Codex-compatible providers.
-- Registers custom API name `codex-lb-responses` at runtime.
-- Reuses OMP's built-in `openai-codex-responses` implementation.
-- Lets the built-in Codex provider initialize with a synthetic internal JWT.
-- Rewrites outbound SSE/WebSocket headers so the real opaque token is sent as `Authorization: Bearer ...`.
+- Registers a provider-level runtime API key override with a synthetic internal JWT so OMP's built-in Codex provider can initialize.
+- Installs fetch/WebSocket header shims that replace the synthetic JWT with the real opaque token before network I/O.
 - Removes `chatgpt-account-id` before the request reaches the custom backend.
+- Keeps provider/model configuration in `models.yml`.
 - Does not patch OMP or require a local OMP fork.
+
+The package still reserves/registers the custom API name `codex-lb-responses` for direct extension use, but normal `models.yml` usage should keep `api: openai-codex-responses`.
 
 ## When not to use it
 
@@ -102,4 +103,4 @@ Then remove or change any `models.yml` provider that relied on opaque-token Code
 
 - Do not commit real `apiKey` values.
 - The real token is only forwarded to the configured `baseUrl`.
-- The plugin uses an internal private header while wrapping OMP's built-in Codex provider, then strips that header before network I/O.
+- The plugin uses an internal synthetic JWT inside OMP, then rewrites it to the real opaque bearer token immediately before network I/O.

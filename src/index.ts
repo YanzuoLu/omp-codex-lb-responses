@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { streamOpenAICodexResponses } from "@oh-my-pi/pi-ai";
@@ -8,8 +9,7 @@ import { parse as parseYaml } from "yaml";
 const CODEX_LB_API = "codex-lb-responses";
 const INNER_CODEX_API = "openai-codex-responses";
 const REAL_TOKEN_HEADER = "x-omp-codex-lb-token";
-const FAKE_ACCOUNT_ID = "codex-lb";
-const SHIM_KEY = Symbol.for("omp.codex-lb-responses.websocket-shim");
+const SHIM_KEY = Symbol.for("omp.codex-lb-responses.transport-shim");
 const DEFAULT_CONTEXT_WINDOW = 272000;
 const DEFAULT_MAX_TOKENS = 128000;
 const DEFAULT_COST = { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 };
@@ -51,16 +51,34 @@ type RawProvider = {
 	models?: unknown;
 };
 type ModelsConfig = { providers?: Record<string, RawProvider> };
+type ShimState = {
+	tokens: Map<string, string>;
+	fetchInstalled: boolean;
+	webSocketInstalled: boolean;
+};
 
-function createFakeCodexJwt(): string {
+function getShimState(): ShimState {
+	const globalRecord = globalThis as typeof globalThis & Record<symbol, ShimState | undefined>;
+	let state = globalRecord[SHIM_KEY];
+	if (!state) {
+		state = { tokens: new Map(), fetchInstalled: false, webSocketInstalled: false };
+		globalRecord[SHIM_KEY] = state;
+	}
+	return state;
+}
+
+function createFakeCodexJwt(accountId: string): string {
 	const header = Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url");
 	const payload = Buffer.from(JSON.stringify({
-		"https://api.openai.com/auth": { chatgpt_account_id: FAKE_ACCOUNT_ID },
+		"https://api.openai.com/auth": { chatgpt_account_id: accountId },
 	})).toString("base64url");
 	return `${header}.${payload}.codexlb`;
 }
 
-const FAKE_CODEX_JWT = createFakeCodexJwt();
+function createFakeAccountId(providerName: string, baseUrl: string): string {
+	const hash = createHash("sha256").update(`${providerName}\0${baseUrl}`).digest("base64url").slice(0, 12);
+	return `codex-lb-${hash}`;
+}
 
 function getAgentDir(): string {
 	return process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".omp", "agent");
@@ -188,7 +206,8 @@ function normalizeModel(model: RawModel): Record<string, unknown> | undefined {
 function discoverCodexLbProviders(): Array<{
 	name: string;
 	baseUrl: string;
-	apiKey: string;
+	realApiKey: string;
+	fakeApiKey: string;
 	headers?: Record<string, string>;
 	authHeader?: boolean;
 	models: Array<Record<string, unknown>>;
@@ -204,10 +223,12 @@ function discoverCodexLbProviders(): Array<{
 		const baseUrl = asNonEmptyString(provider.baseUrl);
 		const apiKey = asNonEmptyString(provider.apiKey);
 		if (!baseUrl || !apiKey || models.length === 0) continue;
+		const realApiKey = resolveConfiguredApiKey(apiKey);
 		discovered.push({
 			name,
 			baseUrl,
-			apiKey,
+			realApiKey,
+			fakeApiKey: createFakeCodexJwt(createFakeAccountId(name, baseUrl)),
 			headers: asHeaders(provider.headers),
 			authHeader: typeof provider.authHeader === "boolean" ? provider.authHeader : undefined,
 			models,
@@ -219,13 +240,40 @@ function discoverCodexLbProviders(): Array<{
 function rewriteCodexLbHeaders(init: HeadersInit | undefined): HeadersInit | undefined {
 	if (!init) return init;
 	const headers = new Headers(init);
-	const realToken = headers.get(REAL_TOKEN_HEADER);
+	const privateToken = headers.get(REAL_TOKEN_HEADER);
+	const authorization = headers.get("authorization") ?? headers.get("Authorization");
+	const bearerToken = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : undefined;
+	const mappedToken = bearerToken ? getShimState().tokens.get(bearerToken) : undefined;
+	const realToken = privateToken ?? mappedToken;
 	if (!realToken) return init;
 
 	headers.set("Authorization", `Bearer ${realToken}`);
 	headers.delete("chatgpt-account-id");
 	headers.delete(REAL_TOKEN_HEADER);
 	return headers;
+}
+
+function installCodexLbFetchShim(): void {
+	const state = getShimState();
+	if (state.fetchInstalled) return;
+	const nativeFetch = globalThis.fetch;
+	if (typeof nativeFetch !== "function") return;
+	const shimFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+		if (init?.headers) {
+			return nativeFetch(input, { ...init, headers: rewriteCodexLbHeaders(init.headers) });
+		}
+		if (input instanceof Request) {
+			const headers = rewriteCodexLbHeaders(input.headers);
+			if (headers !== input.headers) return nativeFetch(new Request(input, { headers }), init);
+		}
+		return nativeFetch(input, init);
+	}) as typeof fetch;
+	const preconnect = (nativeFetch as typeof fetch & { preconnect?: unknown }).preconnect;
+	if (typeof preconnect === "function") {
+		(shimFetch as typeof fetch & { preconnect?: unknown }).preconnect = preconnect.bind(nativeFetch);
+	}
+	globalThis.fetch = shimFetch;
+	state.fetchInstalled = true;
 }
 
 function createCodexLbFetch(fetchOverride: typeof fetch | undefined): typeof fetch {
@@ -240,8 +288,8 @@ function createCodexLbFetch(fetchOverride: typeof fetch | undefined): typeof fet
 }
 
 function installCodexLbWebSocketShim(): void {
-	const globalRecord = globalThis as typeof globalThis & Record<symbol, boolean>;
-	if (globalRecord[SHIM_KEY]) return;
+	const state = getShimState();
+	if (state.webSocketInstalled) return;
 
 	const NativeWebSocket = globalThis.WebSocket;
 	if (typeof NativeWebSocket !== "function") return;
@@ -258,7 +306,12 @@ function installCodexLbWebSocketShim(): void {
 			return Reflect.construct(target, [url, nextOptions, ...rest], newTarget);
 		},
 	}) as typeof WebSocket;
-	globalRecord[SHIM_KEY] = true;
+	state.webSocketInstalled = true;
+}
+
+function installCodexLbTransportShims(): void {
+	installCodexLbFetchShim();
+	installCodexLbWebSocketShim();
 }
 
 function streamCodexLbResponses(
@@ -271,7 +324,7 @@ function streamCodexLbResponses(
 		throw new Error(`No API key for provider: ${model.provider}`);
 	}
 
-	installCodexLbWebSocketShim();
+	installCodexLbTransportShims();
 
 	const innerModel = {
 		...model,
@@ -280,16 +333,18 @@ function streamCodexLbResponses(
 	} as Model<"openai-codex-responses">;
 	const innerOptions = {
 		...options,
-		apiKey: FAKE_CODEX_JWT,
+		apiKey: createFakeCodexJwt(createFakeAccountId(model.provider, model.baseUrl ?? "")),
 		fetch: createCodexLbFetch(options?.fetch),
 		headers: { ...(options?.headers ?? {}), [REAL_TOKEN_HEADER]: realApiKey },
 	};
 
+	getShimState().tokens.set(innerOptions.apiKey, realApiKey);
 	return streamOpenAICodexResponses(innerModel, context, innerOptions);
 }
 
 export default function codexLbResponses(pi: ExtensionApi): void {
 	pi.setLabel?.("Codex LB Responses");
+	installCodexLbTransportShims();
 	const providers = discoverCodexLbProviders();
 	if (providers.length === 0) {
 		pi.registerProvider(CODEX_LB_API, {
@@ -300,14 +355,14 @@ export default function codexLbResponses(pi: ExtensionApi): void {
 	}
 
 	for (const provider of providers) {
+		getShimState().tokens.set(provider.fakeApiKey, provider.realApiKey);
 		pi.registerProvider(provider.name, {
 			baseUrl: provider.baseUrl,
-			apiKey: provider.apiKey,
+			apiKey: provider.fakeApiKey,
 			headers: provider.headers,
 			authHeader: provider.authHeader,
 			api: CODEX_LB_API,
 			streamSimple: streamCodexLbResponses,
-			models: provider.models,
 		});
 	}
 }
