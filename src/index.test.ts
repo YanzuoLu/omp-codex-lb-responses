@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, test } from "bun:test";
-import type { AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import type { AssistantMessageEventStream, Context, Model, ProviderSessionState, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import codexLbResponses from "./index";
 
 type StreamSimple = (model: Model, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream;
@@ -146,6 +146,24 @@ describe("Codex LB utility request options", () => {
 		);
 
 		expect(payload.tool_choice).toBe("required");
+	});
+
+	test("keeps generated utility sessions out of caller provider state", async () => {
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const stream = streamSimple!(createModel(), context, {
+			apiKey: "sk-real-token",
+			disableReasoning: true,
+			preferWebsockets: false,
+			providerSessionState,
+			fetch: async () =>
+				new Response(JSON.stringify({ error: { message: "stop" } }), {
+					status: 401,
+					headers: { "content-type": "application/json" },
+				}),
+		});
+		await stream.result();
+
+		expect(providerSessionState.size).toBe(0);
 	});
 
 	test("rewrites discovered provider fake key to real bearer", async () => {

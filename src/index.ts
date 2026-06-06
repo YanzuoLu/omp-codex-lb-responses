@@ -9,6 +9,7 @@ import type {
 	Effort,
 	Model,
 	OpenAICodexResponsesOptions,
+	ProviderSessionState,
 	SimpleStreamOptions,
 	ToolChoice,
 } from "@oh-my-pi/pi-ai";
@@ -377,14 +378,27 @@ function needsCodexUtilitySession(options: CodexLbStreamOptions | undefined): bo
 	return Boolean(options && !options.sessionId && (options.disableReasoning || options.toolChoice !== undefined));
 }
 
+interface MappedCodexOptions {
+	options: OpenAICodexResponsesOptions;
+	temporaryProviderSessionState?: Map<string, ProviderSessionState>;
+}
+
+function closeProviderSessionState(providerSessionState: Map<string, ProviderSessionState> | undefined): void {
+	if (!providerSessionState) return;
+	for (const state of providerSessionState.values()) state.close();
+	providerSessionState.clear();
+}
+
 function mapCodexOptions(
 	model: Model<"openai-codex-responses">,
 	options: SimpleStreamOptions | undefined,
 	realApiKey: string,
-): OpenAICodexResponsesOptions {
+): MappedCodexOptions {
 	const codexOptions = options as CodexLbStreamOptions | undefined;
 	const generatedSessionId = needsCodexUtilitySession(codexOptions) ? randomUUID() : undefined;
+	const temporaryProviderSessionState = generatedSessionId ? new Map<string, ProviderSessionState>() : undefined;
 	return {
+		options: {
 		temperature: codexOptions?.temperature,
 		topP: codexOptions?.topP,
 		topK: codexOptions?.topK,
@@ -404,7 +418,7 @@ function mapCodexOptions(
 		promptCacheKey: codexOptions?.promptCacheKey,
 		streamFirstEventTimeoutMs: codexOptions?.streamFirstEventTimeoutMs,
 		streamIdleTimeoutMs: codexOptions?.streamIdleTimeoutMs,
-		providerSessionState: codexOptions?.providerSessionState ?? (generatedSessionId ? new Map() : undefined),
+			providerSessionState: temporaryProviderSessionState ?? codexOptions?.providerSessionState,
 		onPayload: mapCodexOnPayload(codexOptions),
 		onResponse: codexOptions?.onResponse,
 		onSseEvent: codexOptions?.onSseEvent,
@@ -417,6 +431,8 @@ function mapCodexOptions(
 		toolChoice: mapCodexToolChoice(codexOptions?.toolChoice),
 		serviceTier: codexOptions?.serviceTier,
 		preferWebsockets: codexOptions?.preferWebsockets ?? (generatedSessionId ? true : undefined),
+		},
+		temporaryProviderSessionState,
 	};
 }
 
@@ -438,10 +454,14 @@ function streamCodexLbResponses(
 		api: INNER_CODEX_API,
 		headers: { ...(model.headers ?? {}), [REAL_TOKEN_HEADER]: realApiKey },
 	} as Model<"openai-codex-responses">;
-	const innerOptions = mapCodexOptions(innerModel, options, realApiKey);
+	const { options: innerOptions, temporaryProviderSessionState } = mapCodexOptions(innerModel, options, realApiKey);
 
 	getShimState().tokens.set(innerOptions.apiKey, realApiKey);
-	return streamOpenAICodexResponses(innerModel, context, innerOptions);
+	const stream = streamOpenAICodexResponses(innerModel, context, innerOptions);
+	if (temporaryProviderSessionState) {
+		void stream.result().finally(() => closeProviderSessionState(temporaryProviderSessionState));
+	}
+	return stream;
 }
 
 export default function codexLbResponses(pi: ExtensionApi): void {
