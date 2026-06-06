@@ -1,0 +1,16 @@
+{
+  "name": "omp-codex-lb-responses",
+  "version": "0.1.0",
+  "type": "module",
+  "private": false,
+  "description": "OMP custom API provider for Codex-compatible load-balanced websocket backends.",
+  "license": "MIT",
+  "omp": {
+    "name": "Codex LB Responses",
+    "description": "Registers api: codex-lb-responses for opaque-token Codex-compatible backends.",
+    "extensions": ["src/index.ts"]
+  },
+  "dependencies": {
+    "@oh-my-pi/pi-ai": ">=15.9.5 <16"
+  }
+}
