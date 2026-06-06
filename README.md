@@ -1,6 +1,6 @@
 # omp-codex-lb-responses
 
-OMP plugin that registers `api: codex-lb-responses` for Codex-compatible load-balanced backends that use opaque bearer tokens such as `sk-clb-...`.
+OMP plugin that enables Codex-compatible load-balanced backends using opaque bearer tokens such as `sk-clb-...`.
 
 Use this when your backend speaks the OpenAI Codex Responses protocol, but is not the official `https://chatgpt.com/backend-api/codex/responses` endpoint and cannot provide a ChatGPT `accountId` from the bearer token.
 
@@ -16,33 +16,36 @@ Check that OMP sees it:
 omp plugin list
 ```
 
-## Configure
+## Configure in `models.yml`
 
-Do not put `api: codex-lb-responses` in `~/.omp/agent/models.yml`. OMP validates `models.yml` before plugins register custom API names, so the plugin registers the provider/model itself.
+Keep provider/model/baseUrl/apiKey in `~/.omp/agent/models.yml`.
 
-Set plugin config instead:
+Important: write the schema-valid API name `openai-codex-responses`, not `codex-lb-responses`. OMP validates `models.yml` before plugins load, so custom plugin API names cannot appear directly in that file.
 
-```sh
-omp plugin config set omp-codex-lb-responses provider codex-lb
-omp plugin config set omp-codex-lb-responses baseUrl https://your-codex-compatible-host/backend-api/codex
-omp plugin config set omp-codex-lb-responses apiKey sk-clb-your-token
-omp plugin config set omp-codex-lb-responses modelId gpt-5.5
-omp plugin config set omp-codex-lb-responses modelName gpt-5.5
-omp plugin config set omp-codex-lb-responses contextWindow 272000
-omp plugin config set omp-codex-lb-responses maxTokens 128000
+```yaml
+providers:
+  codex-lb:
+    baseUrl: https://your-codex-compatible-host/backend-api/codex
+    apiKey: sk-clb-your-token
+    api: openai-codex-responses
+    auth: apiKey
+    models:
+      - id: gpt-5.5
+        name: gpt-5.5
+        reasoning: true
+        input: [text, image]
+        contextWindow: 272000
+        maxTokens: 128000
+        cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 }
 ```
 
-Alternative: omit `apiKey` and set an environment variable instead:
+At runtime, this plugin detects eligible providers and re-registers them with the custom API `codex-lb-responses`.
 
-```sh
-export CODEX_LB_API_KEY=sk-clb-your-token
-```
+A provider is eligible when:
 
-The default `apiKeyEnv` is `CODEX_LB_API_KEY`. You can change it:
-
-```sh
-omp plugin config set omp-codex-lb-responses apiKeyEnv MY_CODEX_LB_API_KEY
-```
+- its effective model API is `openai-codex-responses`
+- it has a non-official `baseUrl`
+- it has an opaque token that does not contain a ChatGPT Codex `accountId`
 
 To force Codex websocket transport, set this in `~/.omp/agent/config.yml`:
 
@@ -67,8 +70,8 @@ omp --smoke-test
 
 ## What this plugin does
 
-- Registers custom API name `codex-lb-responses`.
-- Optionally registers a configured provider/model from plugin settings.
+- Scans `~/.omp/agent/models.yml` for eligible Codex-compatible providers.
+- Registers custom API name `codex-lb-responses` at runtime.
 - Reuses OMP's built-in `openai-codex-responses` implementation.
 - Lets the built-in Codex provider initialize with a synthetic internal JWT.
 - Rewrites outbound SSE/WebSocket headers so the real opaque token is sent as `Authorization: Bearer ...`.
@@ -77,11 +80,7 @@ omp --smoke-test
 
 ## When not to use it
 
-Do not use this for the official ChatGPT Codex endpoint. For official ChatGPT Codex, use OMP's built-in API:
-
-```yaml
-api: openai-codex-responses
-```
+Do not use this for the official ChatGPT Codex endpoint. Official ChatGPT Codex tokens already contain the account id needed by OMP's built-in provider.
 
 ## Update
 
@@ -97,7 +96,7 @@ omp plugin install github:YanzuoLu/omp-codex-lb-responses
 omp plugin uninstall omp-codex-lb-responses
 ```
 
-Remove any plugin-specific model/provider config after uninstalling.
+Then remove or change any `models.yml` provider that relied on opaque-token Codex LB behavior.
 
 ## Security notes
 

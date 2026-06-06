@@ -3,24 +3,16 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { streamOpenAICodexResponses } from "@oh-my-pi/pi-ai";
 import type { AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import { parse as parseYaml } from "yaml";
 
-const PLUGIN_NAME = "omp-codex-lb-responses";
 const CODEX_LB_API = "codex-lb-responses";
 const INNER_CODEX_API = "openai-codex-responses";
 const REAL_TOKEN_HEADER = "x-omp-codex-lb-token";
 const FAKE_ACCOUNT_ID = "codex-lb";
 const SHIM_KEY = Symbol.for("omp.codex-lb-responses.websocket-shim");
-
-const DEFAULT_PROVIDER = "codex-lb";
-const DEFAULT_MODEL_ID = "gpt-5.5";
-const DEFAULT_MODEL_NAME = "gpt-5.5";
 const DEFAULT_CONTEXT_WINDOW = 272000;
 const DEFAULT_MAX_TOKENS = 128000;
-const DEFAULT_COST_INPUT = 5;
-const DEFAULT_COST_OUTPUT = 30;
-const DEFAULT_COST_CACHE_READ = 0.5;
-const DEFAULT_COST_CACHE_WRITE = 0;
-const DEFAULT_API_KEY_ENV = "CODEX_LB_API_KEY";
+const DEFAULT_COST = { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 };
 
 type ExtensionApi = {
 	setLabel?: (label: string) => void;
@@ -33,19 +25,32 @@ type ExtensionApi = {
 			context: Context,
 			options?: SimpleStreamOptions,
 		) => AssistantMessageEventStream;
-		models?: Array<{
-			id: string;
-			name: string;
-			reasoning: boolean;
-			input: ("text" | "image")[];
-			contextWindow: number;
-			maxTokens: number;
-			cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
-		}>;
+		headers?: Record<string, string>;
+		authHeader?: boolean;
+		models?: Array<Record<string, unknown>>;
 	}) => void;
 };
 
-type PluginSettings = Record<string, unknown>;
+type RawCost = { input?: unknown; output?: unknown; cacheRead?: unknown; cacheWrite?: unknown };
+type RawModel = Record<string, unknown> & {
+	id?: unknown;
+	name?: unknown;
+	api?: unknown;
+	reasoning?: unknown;
+	input?: unknown;
+	cost?: RawCost;
+	contextWindow?: unknown;
+	maxTokens?: unknown;
+};
+type RawProvider = {
+	baseUrl?: unknown;
+	apiKey?: unknown;
+	api?: unknown;
+	headers?: unknown;
+	authHeader?: unknown;
+	models?: unknown;
+};
+type ModelsConfig = { providers?: Record<string, RawProvider> };
 
 function createFakeCodexJwt(): string {
 	const header = Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url");
@@ -57,50 +62,158 @@ function createFakeCodexJwt(): string {
 
 const FAKE_CODEX_JWT = createFakeCodexJwt();
 
-function readPluginSettings(): PluginSettings {
-	const lockPath = join(homedir(), ".omp", "plugins", "omp-plugins.lock.json");
-	if (!existsSync(lockPath)) return {};
+function getAgentDir(): string {
+	return process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".omp", "agent");
+}
 
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(readFileSync(lockPath, "utf8"));
-	} catch {
-		return {};
+function readModelsConfig(): ModelsConfig | undefined {
+	for (const name of ["models.yml", "models.yaml"]) {
+		const path = join(getAgentDir(), name);
+		if (!existsSync(path)) continue;
+		try {
+			const parsed = parseYaml(readFileSync(path, "utf8"));
+			return parsed && typeof parsed === "object" ? parsed as ModelsConfig : undefined;
+		} catch {
+			return undefined;
+		}
 	}
-
-	if (!parsed || typeof parsed !== "object") return {};
-	const settings = (parsed as { settings?: Record<string, unknown> }).settings?.[PLUGIN_NAME];
-	if (!settings || typeof settings !== "object") return {};
-	return settings as PluginSettings;
+	return undefined;
 }
 
-function stringSetting(settings: PluginSettings, key: string, fallback: string): string {
-	const value = settings[key];
-	if (typeof value !== "string") return fallback;
-	const trimmed = value.trim();
-	return trimmed.length > 0 ? trimmed : fallback;
-}
-
-function optionalStringSetting(settings: PluginSettings, key: string): string | undefined {
-	const value = settings[key];
+function asNonEmptyString(value: unknown): string | undefined {
 	if (typeof value !== "string") return undefined;
 	const trimmed = value.trim();
 	return trimmed.length > 0 ? trimmed : undefined;
 }
 
-function numberSetting(settings: PluginSettings, key: string, fallback: number): number {
-	const value = settings[key];
+function asPositiveNumber(value: unknown, fallback: number): number {
 	const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
 	return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function resolveConfiguredApiKey(settings: PluginSettings): string | undefined {
-	const direct = optionalStringSetting(settings, "apiKey");
-	if (direct) return direct;
+function asHeaders(value: unknown): Record<string, string> | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const out: Record<string, string> = {};
+	for (const [key, headerValue] of Object.entries(value)) {
+		if (typeof headerValue === "string") out[key] = headerValue;
+	}
+	return Object.keys(out).length > 0 ? out : undefined;
+}
 
-	const envName = stringSetting(settings, "apiKeyEnv", DEFAULT_API_KEY_ENV);
-	const fromEnv = process.env[envName]?.trim();
-	return fromEnv && fromEnv.length > 0 ? fromEnv : undefined;
+function resolveConfiguredApiKey(apiKey: string): string {
+	return process.env[apiKey]?.trim() || apiKey;
+}
+
+function decodeJwtPayload(token: string): Record<string, unknown> | undefined {
+	const parts = token.split(".");
+	if (parts.length < 2) return undefined;
+	try {
+		const decoded = Buffer.from(parts[1]!, "base64url").toString("utf8");
+		const parsed = JSON.parse(decoded);
+		return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function tokenHasCodexAccountId(token: string): boolean {
+	const payload = decodeJwtPayload(token);
+	const auth = payload?.["https://api.openai.com/auth"];
+	return Boolean(
+		auth &&
+			typeof auth === "object" &&
+			"chatgpt_account_id" in auth &&
+			typeof (auth as { chatgpt_account_id?: unknown }).chatgpt_account_id === "string" &&
+			(auth as { chatgpt_account_id: string }).chatgpt_account_id.length > 0,
+	);
+}
+
+function isOfficialCodexBaseUrl(baseUrl: string): boolean {
+	let url: URL;
+	try {
+		url = new URL(baseUrl);
+	} catch {
+		return false;
+	}
+	const path = url.pathname.replace(/\/+$/, "");
+	const responsesPath = path.endsWith("/responses") ? path : `${path}/responses`;
+	return url.origin === "https://chatgpt.com" && responsesPath === "/backend-api/codex/responses";
+}
+
+function providerUsesOnlyCodexResponses(provider: RawProvider, models: RawModel[]): boolean {
+	if (models.length === 0) return false;
+	for (const model of models) {
+		const api = asNonEmptyString(model.api ?? provider.api);
+		if (api !== INNER_CODEX_API) return false;
+	}
+	return true;
+}
+
+function shouldWrapProvider(provider: RawProvider, models: RawModel[]): boolean {
+	const baseUrl = asNonEmptyString(provider.baseUrl);
+	const apiKey = asNonEmptyString(provider.apiKey);
+	if (!baseUrl || !apiKey) return false;
+	if (!providerUsesOnlyCodexResponses(provider, models)) return false;
+	if (isOfficialCodexBaseUrl(baseUrl)) return false;
+	return !tokenHasCodexAccountId(resolveConfiguredApiKey(apiKey));
+}
+
+function normalizeModel(model: RawModel): Record<string, unknown> | undefined {
+	const id = asNonEmptyString(model.id);
+	if (!id) return undefined;
+	const input = Array.isArray(model.input)
+		? model.input.filter((value): value is "text" | "image" => value === "text" || value === "image")
+		: ["text"];
+	const cost = model.cost && typeof model.cost === "object" ? model.cost : DEFAULT_COST;
+	const headers = asHeaders(model.headers);
+	return {
+		...model,
+		id,
+		name: asNonEmptyString(model.name) ?? id,
+		api: CODEX_LB_API,
+		reasoning: typeof model.reasoning === "boolean" ? model.reasoning : true,
+		input: input.length > 0 ? input : ["text"],
+		contextWindow: asPositiveNumber(model.contextWindow, DEFAULT_CONTEXT_WINDOW),
+		maxTokens: asPositiveNumber(model.maxTokens, DEFAULT_MAX_TOKENS),
+		cost: {
+			input: asPositiveNumber(cost.input, DEFAULT_COST.input),
+			output: asPositiveNumber(cost.output, DEFAULT_COST.output),
+			cacheRead: typeof cost.cacheRead === "number" ? cost.cacheRead : DEFAULT_COST.cacheRead,
+			cacheWrite: typeof cost.cacheWrite === "number" ? cost.cacheWrite : DEFAULT_COST.cacheWrite,
+		},
+		...(headers ? { headers } : {}),
+	};
+}
+
+function discoverCodexLbProviders(): Array<{
+	name: string;
+	baseUrl: string;
+	apiKey: string;
+	headers?: Record<string, string>;
+	authHeader?: boolean;
+	models: Array<Record<string, unknown>>;
+}> {
+	const providers = readModelsConfig()?.providers;
+	if (!providers) return [];
+	const discovered = [];
+	for (const [name, provider] of Object.entries(providers)) {
+		if (!provider || typeof provider !== "object") continue;
+		const rawModels = Array.isArray(provider.models) ? provider.models as RawModel[] : [];
+		if (!shouldWrapProvider(provider, rawModels)) continue;
+		const models = rawModels.map(normalizeModel).filter((model): model is Record<string, unknown> => Boolean(model));
+		const baseUrl = asNonEmptyString(provider.baseUrl);
+		const apiKey = asNonEmptyString(provider.apiKey);
+		if (!baseUrl || !apiKey || models.length === 0) continue;
+		discovered.push({
+			name,
+			baseUrl,
+			apiKey,
+			headers: asHeaders(provider.headers),
+			authHeader: typeof provider.authHeader === "boolean" ? provider.authHeader : undefined,
+			models,
+		});
+	}
+	return discovered;
 }
 
 function rewriteCodexLbHeaders(init: HeadersInit | undefined): HeadersInit | undefined {
@@ -177,11 +290,8 @@ function streamCodexLbResponses(
 
 export default function codexLbResponses(pi: ExtensionApi): void {
 	pi.setLabel?.("Codex LB Responses");
-	const settings = readPluginSettings();
-	const baseUrl = optionalStringSetting(settings, "baseUrl");
-	const apiKey = resolveConfiguredApiKey(settings);
-
-	if (!baseUrl || !apiKey) {
+	const providers = discoverCodexLbProviders();
+	if (providers.length === 0) {
 		pi.registerProvider(CODEX_LB_API, {
 			api: CODEX_LB_API,
 			streamSimple: streamCodexLbResponses,
@@ -189,24 +299,15 @@ export default function codexLbResponses(pi: ExtensionApi): void {
 		return;
 	}
 
-	pi.registerProvider(stringSetting(settings, "provider", DEFAULT_PROVIDER), {
-		baseUrl,
-		apiKey,
-		api: CODEX_LB_API,
-		streamSimple: streamCodexLbResponses,
-		models: [{
-			id: stringSetting(settings, "modelId", DEFAULT_MODEL_ID),
-			name: stringSetting(settings, "modelName", DEFAULT_MODEL_NAME),
-			reasoning: true,
-			input: ["text", "image"],
-			contextWindow: numberSetting(settings, "contextWindow", DEFAULT_CONTEXT_WINDOW),
-			maxTokens: numberSetting(settings, "maxTokens", DEFAULT_MAX_TOKENS),
-			cost: {
-				input: numberSetting(settings, "costInput", DEFAULT_COST_INPUT),
-				output: numberSetting(settings, "costOutput", DEFAULT_COST_OUTPUT),
-				cacheRead: numberSetting(settings, "costCacheRead", DEFAULT_COST_CACHE_READ),
-				cacheWrite: numberSetting(settings, "costCacheWrite", DEFAULT_COST_CACHE_WRITE),
-			},
-		}],
-	});
+	for (const provider of providers) {
+		pi.registerProvider(provider.name, {
+			baseUrl: provider.baseUrl,
+			apiKey: provider.apiKey,
+			headers: provider.headers,
+			authHeader: provider.authHeader,
+			api: CODEX_LB_API,
+			streamSimple: streamCodexLbResponses,
+			models: provider.models,
+		});
+	}
 }

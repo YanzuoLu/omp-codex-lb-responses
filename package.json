@@ -1,6 +1,6 @@
 {
   "name": "omp-codex-lb-responses",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "private": false,
   "description": "OMP custom API provider for Codex-compatible load-balanced websocket backends.",
@@ -22,51 +22,11 @@
   ],
   "omp": {
     "name": "Codex LB Responses",
-    "description": "Registers api: codex-lb-responses and optionally exposes a configured Codex-compatible provider.",
-    "extensions": ["src/index.ts"],
-    "settings": {
-      "provider": {
-        "type": "string",
-        "description": "Provider id to expose in OMP when baseUrl and apiKey are configured.",
-        "default": "codex-lb"
-      },
-      "baseUrl": {
-        "type": "string",
-        "description": "Codex-compatible backend base URL, for example https://host/backend-api/codex."
-      },
-      "apiKey": {
-        "type": "string",
-        "description": "Opaque bearer token for the backend.",
-        "secret": true
-      },
-      "apiKeyEnv": {
-        "type": "string",
-        "description": "Environment variable fallback for apiKey.",
-        "default": "CODEX_LB_API_KEY"
-      },
-      "modelId": {
-        "type": "string",
-        "description": "Model id exposed by the provider.",
-        "default": "gpt-5.5"
-      },
-      "modelName": {
-        "type": "string",
-        "description": "Display name for the model.",
-        "default": "gpt-5.5"
-      },
-      "contextWindow": {
-        "type": "number",
-        "description": "Context window tokens.",
-        "default": 272000
-      },
-      "maxTokens": {
-        "type": "number",
-        "description": "Maximum output tokens.",
-        "default": 128000
-      }
-    }
+    "description": "Registers api: codex-lb-responses for eligible Codex-compatible providers declared in models.yml.",
+    "extensions": ["src/index.ts"]
   },
   "dependencies": {
-    "@oh-my-pi/pi-ai": ">=15.9.5 <16"
+    "@oh-my-pi/pi-ai": ">=15.9.5 <16",
+    "yaml": "^2.8.1"
   }
 }
