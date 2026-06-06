@@ -1,6 +1,6 @@
 {
   "name": "omp-codex-lb-responses",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "private": false,
   "description": "OMP custom API provider for Codex-compatible load-balanced websocket backends.",
