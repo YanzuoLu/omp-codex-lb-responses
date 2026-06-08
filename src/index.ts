@@ -1,11 +1,13 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { streamOpenAICodexResponses } from "@oh-my-pi/pi-ai";
 import { getAgentDir as getOmpAgentDir } from "@oh-my-pi/pi-utils/dirs";
-import type { AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import type { AssistantMessageEventStream, Context, Model, OpenAICodexResponsesOptions, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { parse as parseYaml } from "yaml";
 
 const CODEX_API = "openai-codex-responses";
+const CODEX_LB_API = "codex-lb-responses";
 const LEGACY_REAL_TOKEN_HEADER = "x-omp-codex-lb-token";
 const SHIM_KEY = Symbol.for("omp.codex-lb-responses.transport-shim");
 const TOKEN_FINGERPRINT_BYTES = 16;
@@ -316,9 +318,61 @@ function installCodexLbTransportShims(): void {
 	installCodexLbWebSocketShim();
 }
 
+function resolveRealApiKey(apiKey: string): string {
+	return getShimState().tokens.get(apiKey) ?? apiKey;
+}
+
+function createCodexLbFetch(fetchOverride: typeof fetch | undefined): typeof fetch {
+	const baseFetch = fetchOverride ?? fetch;
+	const lbFetch = ((input: RequestInfo | URL, init?: RequestInit) =>
+		baseFetch(input, init ? { ...init, headers: rewriteCodexLbHeaders(init.headers) } : init)) as typeof fetch;
+	const preconnect = (baseFetch as typeof fetch & { preconnect?: unknown }).preconnect;
+	if (typeof preconnect === "function") {
+		(lbFetch as typeof fetch & { preconnect?: unknown }).preconnect = preconnect.bind(baseFetch);
+	}
+	return lbFetch;
+}
+
+function streamCodexLb(
+	model: Model,
+	context: Context,
+	options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+	const apiKey = options?.apiKey;
+	const realApiKey = apiKey ? resolveRealApiKey(apiKey) : undefined;
+	if (!realApiKey || realApiKey === "N/A") {
+		throw new Error(`No API key for provider: ${model.provider}`);
+	}
+
+	installCodexLbTransportShims();
+
+	const innerModel = { ...model, api: CODEX_API, headers: model.headers } as Model<"openai-codex-responses">;
+	const codexOptions = options as SimpleStreamOptions | undefined;
+	const ensuredSessionId = codexOptions?.sessionId ?? randomUUID();
+	const innerApiKey = createFakeApiKey(model.provider, model.baseUrl ?? "", realApiKey);
+
+	const innerOptions: OpenAICodexResponsesOptions = {
+		...codexOptions,
+		apiKey: innerApiKey,
+		sessionId: ensuredSessionId,
+		promptCacheKey: codexOptions?.promptCacheKey ?? codexOptions?.sessionId ?? ensuredSessionId,
+		providerSessionState: codexOptions?.providerSessionState,
+		preferWebsockets: codexOptions?.preferWebsockets ?? true,
+		fetch: createCodexLbFetch(codexOptions?.fetch),
+	};
+
+	getShimState().tokens.set(innerApiKey, realApiKey);
+	return streamOpenAICodexResponses(innerModel, context, innerOptions);
+}
+
 export default function codexLbResponses(pi: ExtensionApi): void {
 	pi.setLabel?.("Codex LB Responses");
 	installCodexLbTransportShims();
+
+	pi.registerProvider(CODEX_LB_API, {
+		api: CODEX_LB_API,
+		streamSimple: streamCodexLb,
+	});
 
 	for (const provider of discoverCodexLbProviders()) {
 		getShimState().tokens.set(provider.fakeApiKey, provider.realApiKey);
@@ -327,7 +381,7 @@ export default function codexLbResponses(pi: ExtensionApi): void {
 			apiKey: provider.fakeApiKey,
 			headers: provider.headers,
 			authHeader: provider.authHeader,
-			api: CODEX_API,
+			api: CODEX_LB_API,
 			models: provider.models,
 			compat: provider.compat,
 		});

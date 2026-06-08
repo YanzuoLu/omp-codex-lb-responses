@@ -51,7 +51,7 @@ providers:
 `);
 		const config = providers["codex-lb"];
 		expect(config).toBeDefined();
-		expect(config.api).toBe("openai-codex-responses");
+		expect(config.api).toBe("codex-lb-responses");
 		expect(config.streamSimple).toBeUndefined();
 		expect(config.baseUrl).toBe("https://lb.example/backend-api/codex");
 		expect(config.models?.[0]?.api).toBe("openai-codex-responses");
