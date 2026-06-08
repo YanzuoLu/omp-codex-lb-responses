@@ -268,18 +268,142 @@ function rewriteCodexLbHeaders(init: HeadersInit | undefined): HeadersInit | und
 	return headers;
 }
 
+function toWsUrl(httpUrl: string): string {
+	return httpUrl.replace(/^https:/, "wss:").replace(/^http:/, "ws:");
+}
+
+function isCodexLbSseRequest(url: string, headers: Headers): boolean {
+	const authorization = headers.get("authorization") ?? headers.get("Authorization");
+	const bearerToken = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : undefined;
+	if (!bearerToken || !getShimState().tokens.has(bearerToken)) return false;
+	const accept = headers.get("accept") ?? "";
+	return accept.includes("text/event-stream");
+}
+
+function fetchViaWebSocket(url: string, init: RequestInit, nativeFetch: typeof fetch): Promise<Response> {
+	const headers = new Headers(init.headers);
+	const rewritten = rewriteCodexLbHeaders(headers) as Headers;
+	rewritten.delete("accept");
+	rewritten.delete("content-type");
+	const betaHeader = rewritten.get("openai-beta");
+	if (betaHeader && betaHeader.includes("responses=")) {
+		rewritten.set("openai-beta", betaHeader.replace(/responses=[^\s,;]+/, "responses_websockets=2026-02-06"));
+	}
+	const headerRecord: Record<string, string> = {};
+	for (const [k, v] of rewritten.entries()) headerRecord[k] = v;
+
+	return new Promise((resolve, reject) => {
+		const wsUrl = toWsUrl(url);
+		const ws = new WebSocket(wsUrl, { headers: headerRecord } as unknown as string[]);
+		(ws as unknown as { binaryType: string }).binaryType = "nodebuffer";
+		const signal = init.signal;
+		let settled = false;
+
+		const onAbort = () => {
+			if (!settled) {
+				settled = true;
+				ws.close(1000, "aborted");
+				reject(new Error("Request was aborted"));
+			}
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+
+		const cleanup = () => { signal?.removeEventListener("abort", onAbort); };
+
+		ws.addEventListener("open", () => {
+			let body: Record<string, unknown>;
+			try {
+				body = JSON.parse(init.body as string);
+			} catch {
+				cleanup();
+				settled = true;
+				ws.close(1000, "bad body");
+				reject(new Error("Failed to parse request body"));
+				return;
+			}
+			body.type = "response.create";
+			ws.send(JSON.stringify(body));
+
+			const encoder = new TextEncoder();
+			const stream = new ReadableStream<Uint8Array>({
+				start(controller) {
+					ws.addEventListener("message", (event: MessageEvent) => {
+						const text = typeof event.data === "string"
+							? event.data
+							: Buffer.isBuffer(event.data) ? event.data.toString("utf8") : String(event.data);
+						let parsed: Record<string, unknown>;
+						try {
+							parsed = JSON.parse(text);
+						} catch {
+							return;
+						}
+						const eventType = typeof parsed.type === "string" ? parsed.type : "";
+						if (!eventType || eventType === "codex.keepalive") return;
+						const sseChunk = `event: ${eventType}\ndata: ${text}\n\n`;
+						controller.enqueue(encoder.encode(sseChunk));
+						if (eventType === "response.completed" || eventType === "response.done" ||
+							eventType === "response.incomplete" || eventType === "response.failed" ||
+							eventType === "error") {
+							ws.close(1000, "done");
+							controller.close();
+						}
+					});
+					ws.addEventListener("close", () => {
+						try { controller.close(); } catch {}
+					});
+					ws.addEventListener("error", (e: Event) => {
+						try { controller.error(new Error(`WebSocket error: ${(e as ErrorEvent).message ?? "unknown"}`)); } catch {}
+					});
+				},
+				cancel() {
+					ws.close(1000, "cancelled");
+				},
+			});
+
+			settled = true;
+			cleanup();
+			resolve(new Response(stream, {
+				status: 200,
+				statusText: "OK",
+				headers: { "content-type": "text/event-stream; charset=utf-8" },
+			}));
+		});
+
+		ws.addEventListener("error", (e: Event) => {
+			cleanup();
+			if (!settled) {
+				settled = true;
+				reject(new Error(`WebSocket connection failed: ${(e as ErrorEvent).message ?? "unknown"}`));
+			}
+		});
+
+		ws.addEventListener("close", (e: CloseEvent) => {
+			cleanup();
+			if (!settled) {
+				settled = true;
+				reject(new Error(`WebSocket closed before open: ${e.code} ${e.reason}`));
+			}
+		});
+	});
+}
+
 function installCodexLbFetchShim(): void {
 	const state = getShimState();
 	if (state.fetchInstalled) return;
 	const nativeFetch = globalThis.fetch;
 	if (typeof nativeFetch !== "function") return;
 	const shimFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+		const url = input instanceof Request ? input.url : input.toString();
+		const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+		if (isCodexLbSseRequest(url, headers) && init?.body) {
+			return fetchViaWebSocket(url, init, nativeFetch);
+		}
 		if (init?.headers) {
 			return nativeFetch(input, { ...init, headers: rewriteCodexLbHeaders(init.headers) });
 		}
 		if (input instanceof Request) {
-			const headers = rewriteCodexLbHeaders(input.headers);
-			if (headers !== input.headers) return nativeFetch(new Request(input, { headers }), init);
+			const rewritten = rewriteCodexLbHeaders(input.headers);
+			if (rewritten !== input.headers) return nativeFetch(new Request(input, { headers: rewritten }), init);
 		}
 		return nativeFetch(input, init);
 	}) as typeof fetch;
