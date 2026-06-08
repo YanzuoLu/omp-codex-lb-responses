@@ -16,7 +16,7 @@ This repo ships **two components** that work together:
 omp plugin install github:YanzuoLu/omp-codex-lb-responses
 
 # 2. Apply patches
-bunx github:YanzuoLu/omp-codex-lb-responses
+bunx github:YanzuoLu/omp-codex-lb-responses#main#main
 ```
 
 ## Configure
@@ -70,9 +70,9 @@ Without these patches, long conversations fall back to local summarization (losi
 ## Patcher commands
 
 ```bash
-bunx github:YanzuoLu/omp-codex-lb-responses          # apply
-bunx github:YanzuoLu/omp-codex-lb-responses --check   # verify
-bunx github:YanzuoLu/omp-codex-lb-responses --revert  # undo
+bunx github:YanzuoLu/omp-codex-lb-responses#main          # apply
+bunx github:YanzuoLu/omp-codex-lb-responses#main --check   # verify
+bunx github:YanzuoLu/omp-codex-lb-responses#main --revert  # undo
 ```
 
 ## After `omp update`
@@ -80,13 +80,13 @@ bunx github:YanzuoLu/omp-codex-lb-responses --revert  # undo
 The plugin survives updates. Patches don't — re-apply:
 
 ```bash
-bunx github:YanzuoLu/omp-codex-lb-responses
+bunx github:YanzuoLu/omp-codex-lb-responses#main
 ```
 
 ## Uninstall
 
 ```bash
-bunx github:YanzuoLu/omp-codex-lb-responses --revert
+bunx github:YanzuoLu/omp-codex-lb-responses#main --revert
 omp plugin uninstall omp-codex-lb-responses
 ```
 
