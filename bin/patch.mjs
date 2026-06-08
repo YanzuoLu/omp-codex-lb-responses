@@ -40,6 +40,15 @@ const PATCHES = [
 					`}`,
 				].join("\n"),
 			},
+			{
+				label: "createCodexHeaders: skip chatgpt-account-id for synthetic IDs",
+				find: `\theaders.set(OPENAI_HEADERS.ACCOUNT_ID, accountId);`,
+				replace: [
+					`\tif (!accountId.startsWith("opaque-")) {`,
+					`\t\theaders.set(OPENAI_HEADERS.ACCOUNT_ID, accountId);`,
+					`\t}`,
+				].join("\n"),
+			},
 		],
 	},
 	{
