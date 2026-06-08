@@ -202,7 +202,7 @@ function normalizeModel(model: RawModel): Record<string, unknown> | undefined {
 		...model,
 		id,
 		name: asNonEmptyString(model.name) ?? id,
-		api: CODEX_API,
+		api: CODEX_LB_API,
 		reasoning: typeof model.reasoning === "boolean" ? model.reasoning : true,
 		input: input.length > 0 ? input : ["text"],
 		contextWindow: asPositiveNumber(model.contextWindow, DEFAULT_CONTEXT_WINDOW),

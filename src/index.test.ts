@@ -54,7 +54,7 @@ providers:
 		expect(config.api).toBe("codex-lb-responses");
 		expect(config.streamSimple).toBeUndefined();
 		expect(config.baseUrl).toBe("https://lb.example/backend-api/codex");
-		expect(config.models?.[0]?.api).toBe("openai-codex-responses");
+		expect(config.models?.[0]?.api).toBe("codex-lb-responses");
 		expect(config.models?.[0]?.id).toBe("gpt-5");
 		expect(config.compat?.supportsReasoningEffort).toBe(false);
 	});
