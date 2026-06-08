@@ -553,7 +553,7 @@ export default function codexLbResponses(pi: ExtensionApi): void {
 
 	for (const provider of discoverCodexLbProviders()) {
 		getShimState().tokens.set(provider.fakeApiKey, provider.realApiKey);
-		pi.registerProvider("openai-codex", {
+		pi.registerProvider(provider.name, {
 			baseUrl: provider.baseUrl,
 			apiKey: provider.fakeApiKey,
 			headers: provider.headers,
