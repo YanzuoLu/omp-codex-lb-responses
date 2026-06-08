@@ -16,7 +16,7 @@ This repo ships **two components** that work together:
 omp plugin install github:YanzuoLu/omp-codex-lb-responses
 
 # 2. Apply patches
-bunx github:YanzuoLu/omp-codex-lb-responses#main#main
+bunx github:YanzuoLu/omp-codex-lb-responses#main
 ```
 
 ## Configure
