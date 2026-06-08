@@ -1,6 +1,6 @@
 {
   "name": "omp-codex-lb-responses",
-  "version": "0.10.3",
+  "version": "0.10.4",
   "type": "module",
   "private": false,
   "description": "OMP auth shim for Codex-compatible load-balanced websocket backends.",
