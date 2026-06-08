@@ -280,7 +280,12 @@ function isCodexLbSseRequest(url: string, headers: Headers): boolean {
 	return accept.includes("text/event-stream");
 }
 
-function fetchViaWebSocket(url: string, init: RequestInit, nativeFetch: typeof fetch): Promise<Response> {
+const WS_PROXY_IDLE_TIMEOUT_MS = 300_000;
+const WS_PROXY_TERMINAL_EVENTS = new Set([
+	"response.completed", "response.done", "response.incomplete", "response.failed", "error",
+]);
+
+function fetchViaWebSocket(url: string, init: RequestInit): Promise<Response> {
 	const headers = new Headers(init.headers);
 	const rewritten = rewriteCodexLbHeaders(headers) as Headers;
 	rewritten.delete("accept");
@@ -298,70 +303,91 @@ function fetchViaWebSocket(url: string, init: RequestInit, nativeFetch: typeof f
 		(ws as unknown as { binaryType: string }).binaryType = "nodebuffer";
 		const signal = init.signal;
 		let settled = false;
+		let streamClosed = false;
+		let idleTimer: ReturnType<typeof setTimeout> | undefined;
+		let controllerRef: ReadableStreamDefaultController<Uint8Array> | undefined;
+
+		const teardown = () => {
+			if (idleTimer) { clearTimeout(idleTimer); idleTimer = undefined; }
+			signal?.removeEventListener("abort", onAbort);
+			if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+				ws.close(1000, "teardown");
+			}
+		};
+
+		const closeStream = (reason?: Error) => {
+			if (streamClosed) return;
+			streamClosed = true;
+			teardown();
+			if (!controllerRef) return;
+			if (reason) {
+				try { controllerRef.error(reason); } catch {}
+			} else {
+				try { controllerRef.close(); } catch {}
+			}
+		};
+
+		const resetIdleTimer = () => {
+			if (idleTimer) clearTimeout(idleTimer);
+			idleTimer = setTimeout(() => {
+				closeStream(new Error("WebSocket proxy idle timeout"));
+			}, WS_PROXY_IDLE_TIMEOUT_MS);
+		};
 
 		const onAbort = () => {
 			if (!settled) {
 				settled = true;
-				ws.close(1000, "aborted");
+				teardown();
 				reject(new Error("Request was aborted"));
+				return;
 			}
+			closeStream(new Error("Request was aborted"));
 		};
-		signal?.addEventListener("abort", onAbort, { once: true });
-
-		const cleanup = () => { signal?.removeEventListener("abort", onAbort); };
+		signal?.addEventListener("abort", onAbort);
 
 		ws.addEventListener("open", () => {
 			let body: Record<string, unknown>;
 			try {
 				body = JSON.parse(init.body as string);
 			} catch {
-				cleanup();
 				settled = true;
-				ws.close(1000, "bad body");
+				teardown();
 				reject(new Error("Failed to parse request body"));
 				return;
 			}
 			body.type = "response.create";
 			ws.send(JSON.stringify(body));
+			resetIdleTimer();
 
 			const encoder = new TextEncoder();
 			const stream = new ReadableStream<Uint8Array>({
 				start(controller) {
+					controllerRef = controller;
 					ws.addEventListener("message", (event: MessageEvent) => {
+						if (streamClosed) return;
+						resetIdleTimer();
 						const text = typeof event.data === "string"
 							? event.data
 							: Buffer.isBuffer(event.data) ? event.data.toString("utf8") : String(event.data);
 						let parsed: Record<string, unknown>;
-						try {
-							parsed = JSON.parse(text);
-						} catch {
-							return;
-						}
+						try { parsed = JSON.parse(text); } catch { return; }
 						const eventType = typeof parsed.type === "string" ? parsed.type : "";
 						if (!eventType || eventType === "codex.keepalive") return;
 						const sseChunk = `event: ${eventType}\ndata: ${text}\n\n`;
-						controller.enqueue(encoder.encode(sseChunk));
-						if (eventType === "response.completed" || eventType === "response.done" ||
-							eventType === "response.incomplete" || eventType === "response.failed" ||
-							eventType === "error") {
-							ws.close(1000, "done");
-							controller.close();
+						try { controller.enqueue(encoder.encode(sseChunk)); } catch { return; }
+						if (WS_PROXY_TERMINAL_EVENTS.has(eventType)) {
+							closeStream();
 						}
 					});
-					ws.addEventListener("close", () => {
-						try { controller.close(); } catch {}
-					});
+					ws.addEventListener("close", () => { closeStream(); });
 					ws.addEventListener("error", (e: Event) => {
-						try { controller.error(new Error(`WebSocket error: ${(e as ErrorEvent).message ?? "unknown"}`)); } catch {}
+						closeStream(new Error(`WebSocket error: ${(e as ErrorEvent).message ?? "unknown"}`));
 					});
 				},
-				cancel() {
-					ws.close(1000, "cancelled");
-				},
+				cancel() { closeStream(); },
 			});
 
 			settled = true;
-			cleanup();
 			resolve(new Response(stream, {
 				status: 200,
 				statusText: "OK",
@@ -370,17 +396,17 @@ function fetchViaWebSocket(url: string, init: RequestInit, nativeFetch: typeof f
 		});
 
 		ws.addEventListener("error", (e: Event) => {
-			cleanup();
 			if (!settled) {
 				settled = true;
+				teardown();
 				reject(new Error(`WebSocket connection failed: ${(e as ErrorEvent).message ?? "unknown"}`));
 			}
 		});
 
 		ws.addEventListener("close", (e: CloseEvent) => {
-			cleanup();
 			if (!settled) {
 				settled = true;
+				teardown();
 				reject(new Error(`WebSocket closed before open: ${e.code} ${e.reason}`));
 			}
 		});
@@ -396,7 +422,7 @@ function installCodexLbFetchShim(): void {
 		const url = input instanceof Request ? input.url : input.toString();
 		const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
 		if (isCodexLbSseRequest(url, headers) && init?.body) {
-			return fetchViaWebSocket(url, init, nativeFetch);
+			return fetchViaWebSocket(url, init);
 		}
 		if (init?.headers) {
 			return nativeFetch(input, { ...init, headers: rewriteCodexLbHeaders(init.headers) });
