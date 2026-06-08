@@ -1,37 +1,43 @@
-# omp-codex-lb-responses
+# omp-codex-lb-patch
 
-OMP plugin for Codex-compatible load-balanced backends that use opaque bearer tokens such as `sk-clb-...`.
+Patch [omp](https://github.com/can1357/oh-my-pi) to support non-JWT API keys on `openai-codex-responses` backends such as [codex-lb](https://github.com/Soju06/codex-lb).
 
-Use this when your backend speaks the OpenAI Codex Responses protocol, but is not the official `https://chatgpt.com/backend-api/codex/responses` endpoint and cannot provide a ChatGPT `accountId` from the bearer token.
+## What it does
 
-## Install
+omp's built-in Codex provider assumes the API key is a ChatGPT OAuth JWT and throws `"Failed to extract accountId from token"` for plain API keys. This patcher applies 4 minimal changes (≈10 lines) to the installed omp:
 
-```sh
-omp plugin install github:YanzuoLu/omp-codex-lb-responses
+| Change | File | Effect |
+|--------|------|--------|
+| `getAccountId` fallback | `pi-ai/…/openai-codex-responses.ts` | Derives a stable hash ID instead of throwing on non-JWT tokens |
+| Remote compaction gate | `pi-agent-core/…/compaction/openai.ts` | Enables server-side compaction for any `openai-codex-responses` provider |
+| Freeform tool format | `pi-ai/…/model-thinking.ts` | Enables grammar-based `apply_patch` tool for non-official providers |
+| Image gen guard | `pi-coding-agent/…/tools/image-gen.ts` | Skips `chatgpt-account-id` header instead of throwing |
+
+## Usage
+
+```bash
+# Apply patches (run after omp install/update)
+bunx github:YanzuoLu/omp-codex-lb-responses
+
+# Check if patches are applied
+bunx github:YanzuoLu/omp-codex-lb-responses --check
+
+# Revert to original
+bunx github:YanzuoLu/omp-codex-lb-responses --revert
 ```
 
-Check that OMP sees it:
+## Configure `models.yml`
 
-```sh
-omp plugin list
-```
-
-## Configure in `models.yml`
-
-Keep provider/model/baseUrl/apiKey in `~/.omp/agent/models.yml`.
-
-Write the schema-valid API name `openai-codex-responses`, not `codex-lb-responses`. OMP validates `models.yml` before plugins load, so custom plugin API names cannot appear directly in that file.
+After patching, use `api: openai-codex-responses` directly with your codex-lb backend — no plugin needed:
 
 ```yaml
 providers:
   codex-lb:
-    baseUrl: https://your-codex-compatible-host/backend-api/codex
+    baseUrl: https://your-codex-lb-host/backend-api
     apiKey: sk-clb-your-token
     api: openai-codex-responses
-    auth: apiKey
     models:
-      - id: gpt-5.5
-        name: gpt-5.5
+      - id: gpt-5
         reasoning: true
         input: [text, image]
         contextWindow: 272000
@@ -39,73 +45,15 @@ providers:
         cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 }
 ```
 
-At runtime, this plugin detects eligible providers and installs an auth shim for them.
+## After `omp update`
 
-A provider is eligible when:
+`omp update` restores the original files. Re-run the patcher:
 
-- its effective model API is `openai-codex-responses`
-- it has a non-official `baseUrl`
-- it has an opaque token that does not contain a ChatGPT Codex `accountId`
-
-Set this in `~/.omp/agent/config.yml` to enable Codex WebSocket transport:
-
-```yaml
-providers:
-  openaiWebsockets: "on"
+```bash
+bunx github:YanzuoLu/omp-codex-lb-responses
 ```
-
-For discovered `models.yml` providers, this plugin keeps the model API as `openai-codex-responses` so OMP core still runs its Codex lifecycle hooks: WebSocket prewarm, transport status, thinking metadata inference, and provider-session cleanup. The plugin only installs fetch/WebSocket shims that swap the synthetic token into the actual network request.
-
-If WebSocket fails, OMP can still fall back to Codex Responses SSE (`text/event-stream`). SSE is the same Codex Responses protocol over HTTP streaming, not OpenAI chat/completions.
-
-
-## Verify
-
-List models and confirm your provider/model appears:
-
-```sh
-omp --list-models codex-lb
-```
-
-Then run the smoke test:
-
-```sh
-omp --smoke-test
-```
-
-## What this plugin does
-
-- Scans `~/.omp/agent/models.yml` for eligible Codex-compatible providers.
-- Registers a provider-level runtime API key override with a synthetic internal JWT so OMP's built-in Codex provider can initialize.
-- Installs fetch/WebSocket header shims that replace the synthetic JWT with the real opaque token before network I/O.
-- Removes `chatgpt-account-id` before the request reaches the custom backend.
-- Keeps provider/model configuration in `models.yml`.
-- Does not patch OMP or require a local OMP fork.
-
-The package still reserves/registers the custom API name `codex-lb-responses` for direct extension use, but normal `models.yml` usage should keep `api: openai-codex-responses`.
-
-## When not to use it
-
-Do not use this for the official ChatGPT Codex endpoint. Official ChatGPT Codex tokens already contain the account id needed by OMP's built-in provider.
-
-## Update
-
-Re-run install:
-
-```sh
-omp plugin install github:YanzuoLu/omp-codex-lb-responses
-```
-
-## Uninstall
-
-```sh
-omp plugin uninstall omp-codex-lb-responses
-```
-
-Then remove or change any `models.yml` provider that relied on opaque-token Codex LB behavior.
 
 ## Security notes
 
-- Do not commit real `apiKey` values.
-- The real token is only forwarded to the configured `baseUrl`.
-- The plugin uses an internal synthetic JWT inside OMP, then rewrites it to the real opaque bearer token immediately before network I/O.
+- The real API key is sent directly to your configured `baseUrl` — no synthetic JWT or fetch shim involved.
+- Do not commit real `apiKey` values to `models.yml`.
