@@ -31,8 +31,8 @@ providers:
     api: openai-codex-responses
     auth: apiKey
     models:
-      - id: gpt-5
-        name: gpt-5
+      - id: gpt-5.5
+        name: gpt-5.5
         reasoning: true
         input: [text, image]
         contextWindow: 272000
