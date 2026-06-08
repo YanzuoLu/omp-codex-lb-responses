@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { streamOpenAICodexResponses } from "@oh-my-pi/pi-ai";
+import { AssistantMessageEventStream, streamOpenAICodexResponses } from "@oh-my-pi/pi-ai";
 import { getAgentDir as getOmpAgentDir } from "@oh-my-pi/pi-utils/dirs";
-import type { AssistantMessageEventStream, Context, Model, OpenAICodexResponsesOptions, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import type { Context, Model, OpenAICodexResponsesOptions, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { parse as parseYaml } from "yaml";
 
 const CODEX_API = "openai-codex-responses";
@@ -364,7 +364,32 @@ function streamCodexLb(
 	};
 
 	getShimState().tokens.set(innerApiKey, realApiKey);
-	return streamOpenAICodexResponses(innerModel, context, innerOptions);
+	const inner = streamOpenAICodexResponses(innerModel, context, innerOptions);
+
+	const outer = new AssistantMessageEventStream();
+	(async () => {
+		try {
+			for await (const event of inner) {
+				const ev = event as Record<string, unknown>;
+				if (ev.message && typeof ev.message === "object") {
+					(ev.message as Record<string, unknown>).api = CODEX_LB_API;
+				}
+				if (ev.partial && typeof ev.partial === "object") {
+					(ev.partial as Record<string, unknown>).api = CODEX_LB_API;
+				}
+				if (ev.error && typeof ev.error === "object") {
+					(ev.error as Record<string, unknown>).api = CODEX_LB_API;
+				}
+				outer.push(event);
+			}
+			const result = await inner.result();
+			result.api = CODEX_LB_API as any;
+			outer.end(result);
+		} catch (error) {
+			outer.fail(error);
+		}
+	})();
+	return outer;
 }
 
 export default function codexLbResponses(pi: ExtensionApi): void {
