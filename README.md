@@ -54,7 +54,7 @@ providers:
   openaiWebsockets: "on"
 ```
 
-For discovered `models.yml` providers, this plugin keeps the model API as `openai-codex-responses` so OMP core still runs its Codex lifecycle hooks: WebSocket prewarm, transport status, and provider-session cleanup. The plugin only swaps the opaque token into the actual fetch/WebSocket request.
+For discovered `models.yml` providers, this plugin keeps the model API as `openai-codex-responses` so OMP core still runs its Codex lifecycle hooks: WebSocket prewarm, transport status, thinking metadata inference, and provider-session cleanup. The plugin only installs fetch/WebSocket shims that swap the synthetic token into the actual network request.
 
 If WebSocket fails, OMP can still fall back to Codex Responses SSE (`text/event-stream`). SSE is the same Codex Responses protocol over HTTP streaming, not OpenAI chat/completions.
 
