@@ -356,8 +356,10 @@ function streamCodexLb(
 		apiKey: innerApiKey,
 		sessionId: ensuredSessionId,
 		promptCacheKey: codexOptions?.promptCacheKey ?? codexOptions?.sessionId ?? ensuredSessionId,
-		providerSessionState: codexOptions?.providerSessionState,
+		providerSessionState: codexOptions?.providerSessionState ?? new Map(),
 		preferWebsockets: codexOptions?.preferWebsockets ?? true,
+		reasoning: codexOptions?.disableReasoning ? "none" : codexOptions?.reasoning as OpenAICodexResponsesOptions["reasoning"],
+		reasoningSummary: codexOptions?.hideThinkingSummary ? null : undefined,
 		fetch: createCodexLbFetch(codexOptions?.fetch),
 	};
 
