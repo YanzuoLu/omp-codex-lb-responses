@@ -1,33 +1,25 @@
 {
-  "name": "omp-codex-lb-responses",
-  "version": "0.12.1",
+  "name": "omp-codex-lb-patch",
+  "version": "1.0.0",
   "type": "module",
-  "private": false,
-  "description": "OMP auth shim for Codex-compatible load-balanced websocket backends.",
+  "description": "Patch omp to support non-JWT API keys on openai-codex-responses backends (e.g. codex-lb).",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/YanzuoLu/omp-codex-lb-responses.git"
   },
-  "homepage": "https://github.com/YanzuoLu/omp-codex-lb-responses#readme",
-  "bugs": {
-    "url": "https://github.com/YanzuoLu/omp-codex-lb-responses/issues"
+  "bin": {
+    "omp-codex-lb-patch": "bin/patch.mjs"
   },
+  "files": [
+    "bin/",
+    "patches/"
+  ],
   "keywords": [
     "omp",
     "oh-my-pi",
     "codex",
-    "websocket",
-    "responses"
-  ],
-  "omp": {
-    "name": "Codex LB Responses",
-    "description": "Installs an auth shim for eligible Codex-compatible providers declared in models.yml.",
-    "extensions": ["src/index.ts"]
-  },
-  "dependencies": {
-    "@oh-my-pi/pi-ai": ">=15.9.5 <16",
-    "@oh-my-pi/pi-utils": ">=15.9.5 <16",
-    "yaml": "^2.8.1"
-  }
+    "codex-lb",
+    "patch"
+  ]
 }
