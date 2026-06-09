@@ -442,3 +442,37 @@ describe("hosted web_search injection", () => {
 		);
 	});
 });
+
+describe("codex-lb web-search tool mode", () => {
+	test("webSearch: tool publishes the codex-lb web-search config and does not inject", () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "codex-lb-tool-"));
+		writeFileSync(
+			join(agentDir, "models.yml"),
+			`providers:\n  codex-lb:\n    baseUrl: https://lb.example/backend-api/codex/\n    apiKey: sk-real-token\n    api: openai-codex-responses\n    webSearch: tool\n    models:\n      - id: gpt-5\n`,
+		);
+		const previousAgentDir = getAgentDir();
+		const wsKey = Symbol.for("omp.codex-lb-responses.web-search");
+		const shimKey = Symbol.for("omp.codex-lb-responses.transport-shim");
+		const g = globalThis as typeof globalThis &
+			Record<symbol, { baseUrl?: string; apiKey?: string; accountId?: string } | { webSearchWsPrefixes?: Set<string> } | undefined>;
+		const prevConfig = g[wsKey];
+		try {
+			setAgentDir(agentDir);
+			g[wsKey] = undefined;
+			(g[shimKey] as { webSearchWsPrefixes?: Set<string> } | undefined)?.webSearchWsPrefixes?.clear();
+			codexLbResponses({ registerProvider() {} });
+			const cfg = g[wsKey] as { baseUrl: string; apiKey: string; accountId: string };
+			expect(cfg).toBeDefined();
+			expect(cfg.baseUrl).toBe("https://lb.example/backend-api/codex"); // trailing slash stripped
+			expect(cfg.apiKey).toBe("sk-real-token"); // real key, not the synthetic JWT
+			expect(typeof cfg.accountId).toBe("string");
+			expect(cfg.accountId.length).toBeGreaterThan(0);
+			// tool mode must NOT register an injection prefix
+			const prefixes = (g[shimKey] as { webSearchWsPrefixes?: Set<string> } | undefined)?.webSearchWsPrefixes;
+			expect(prefixes?.size ?? 0).toBe(0);
+		} finally {
+			setAgentDir(previousAgentDir);
+			g[wsKey] = prevConfig;
+		}
+	});
+});

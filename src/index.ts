@@ -10,6 +10,7 @@ const CODEX_API = "openai-codex-responses";
 const CODEX_LB_API = "codex-lb-responses";
 const LEGACY_REAL_TOKEN_HEADER = "x-omp-codex-lb-token";
 const SHIM_KEY = Symbol.for("omp.codex-lb-responses.transport-shim");
+const WEB_SEARCH_CONFIG_KEY = Symbol.for("omp.codex-lb-responses.web-search");
 const TOKEN_FINGERPRINT_BYTES = 16;
 const DEFAULT_CONTEXT_WINDOW = 272000;
 const DEFAULT_MAX_TOKENS = 128000;
@@ -220,6 +221,26 @@ function normalizeModel(model: RawModel): Record<string, unknown> | undefined {
 	};
 }
 
+type WebSearchMode = "off" | "inject" | "tool";
+type CodexLbWebSearchConfig = { baseUrl: string; apiKey: string; accountId: string };
+
+function parseWebSearchMode(value: unknown): WebSearchMode {
+	if (value === true || value === "inject") return "inject";
+	if (value === "tool") return "tool";
+	return "off";
+}
+
+/**
+ * Publishes the codex-lb endpoint + real key for the patched omp `codex` search
+ * provider (see bin/patch.mjs) to read, so omp's native web-search card runs
+ * through codex-lb instead of the official ChatGPT OAuth endpoint. First
+ * `tool`-mode provider wins.
+ */
+function setCodexLbWebSearchConfig(config: CodexLbWebSearchConfig): void {
+	const record = globalThis as typeof globalThis & Record<symbol, CodexLbWebSearchConfig | undefined>;
+	if (!record[WEB_SEARCH_CONFIG_KEY]) record[WEB_SEARCH_CONFIG_KEY] = config;
+}
+
 function discoverCodexLbProviders(): Array<{
 	name: string;
 	baseUrl: string;
@@ -229,7 +250,7 @@ function discoverCodexLbProviders(): Array<{
 	authHeader?: boolean;
 	models: Array<Record<string, unknown>>;
 	compat?: Record<string, unknown>;
-	webSearch: boolean;
+	webSearch: WebSearchMode;
 }> {
 	const providers = readModelsConfig()?.providers;
 	if (!providers) return [];
@@ -253,7 +274,7 @@ function discoverCodexLbProviders(): Array<{
 			authHeader: typeof provider.authHeader === "boolean" ? provider.authHeader : undefined,
 			models,
 			compat: asPlainRecord(provider.compat),
-			webSearch: provider.webSearch === true,
+			webSearch: parseWebSearchMode(provider.webSearch),
 		});
 	}
 	return discovered;
@@ -695,8 +716,14 @@ export default function codexLbResponses(pi: ExtensionApi): void {
 
 	for (const provider of discoverCodexLbProviders()) {
 		getShimState().tokens.set(provider.fakeApiKey, provider.realApiKey);
-		if (provider.webSearch) {
+		if (provider.webSearch === "inject") {
 			getShimState().webSearchWsPrefixes.add(toWsUrl(provider.baseUrl.replace(/\/+$/, "")));
+		} else if (provider.webSearch === "tool") {
+			setCodexLbWebSearchConfig({
+				baseUrl: provider.baseUrl.replace(/\/+$/, ""),
+				apiKey: provider.realApiKey,
+				accountId: createFakeAccountId(provider.name, provider.baseUrl, provider.realApiKey),
+			});
 		}
 		pi.registerProvider(provider.name, {
 			baseUrl: provider.baseUrl,

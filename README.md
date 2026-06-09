@@ -30,7 +30,7 @@ providers:
     apiKey: sk-clb-your-token
     api: openai-codex-responses
     auth: apiKey
-    webSearch: true          # optional — Codex-style hosted web search (see "Web search" below)
+    webSearch: tool          # optional — web search via codex-lb: "tool" (native card) or "inject" (no patch). See "Web search" below.
     models:
       - id: gpt-5.5
         name: gpt-5.5
@@ -54,20 +54,40 @@ providers:
 
 ## Web search (optional)
 
-Set `webSearch: true` on a codex-lb provider to get Codex-CLI-style web search:
-the plugin injects the hosted `web_search` tool into the model's `response.create`
-frame, so the search runs **server-side on your codex-lb account** — no separate
-search API key and no `/login openai-codex` OAuth.
+Give the model web search through your codex-lb account — no separate search API
+key, no `/login openai-codex` OAuth. Pick **one** mode per provider in `models.yml`
+via the `webSearch` flag. (Your codex-lb account/plan must actually have web
+search — the same one the Codex CLI uses.)
 
-- It replaces omp's client-side `web_search` function tool (the one gated behind
-  `providers.webSearch` / ChatGPT OAuth) for these providers, so the model
-  searches through codex-lb instead of omp's own search provider.
-- **Caveat:** omp does not render the hosted search's step UI or structured
-  citations — the answer is web-informed and usually includes inline source URLs,
-  but there's no "Searching…" tool card. (omp ignores the `web_search_call`
-  stream events, but keeps the item in history, so multi-turn stays consistent.)
-- Requires that your codex-lb account/plan actually has web search — the same one
-  the Codex CLI uses.
+### `webSearch: tool` — native search card (recommended)
+
+The model uses omp's own `web_search` tool, but the request is routed to codex-lb
+instead of the official ChatGPT endpoint, so you get omp's full **"Search" card +
+clickable sources**, identical to the built-in Codex search.
+
+Requires the optional patch (`bin/patch.mjs` redirects omp's `codex` search
+provider — see [What the patcher does](#what-the-patcher-does)) plus:
+
+```yaml
+# ~/.omp/agent/config.yml
+providers:
+  webSearch: codex        # select omp's codex search provider (now → codex-lb)
+```
+
+```bash
+# pin the search to a model your codex-lb supports (omp's defaults may be rejected)
+export PI_CODEX_WEB_SEARCH_MODEL=gpt-5.5
+```
+
+### `webSearch: inject` — no patch, no UI
+
+Plugin-only. The plugin injects the hosted `web_search` tool into the model's
+`response.create` frame (Codex-CLI-style); the search runs server-side and the
+answer is web-informed with inline source URLs, but there's **no search card /
+structured citations** (omp ignores the `web_search_call` events — it keeps the
+item in history so multi-turn stays consistent). No patch needed.
+
+> Don't set both modes on one provider. `webSearch: true` is an alias for `inject`.
 
 ## What the plugin does
 
@@ -90,8 +110,9 @@ Two checks in omp are hardcoded to `model.provider === "openai-codex"` and canno
 |-------|------|--------|
 | Remote compaction | `pi-agent-core/.../compaction/openai.ts` | Also accept `model.api === "openai-codex-responses"` |
 | Freeform apply-patch | `pi-ai/.../model-thinking.ts` | Gate on `model.api` alone, not `model.provider` |
+| Web search → codex-lb *(optional)* | `pi-coding-agent/.../web/search/providers/codex.ts` | Route omp's `codex` search provider to codex-lb when a provider sets `webSearch: tool`. No-op (falls back to official OAuth) when unset. |
 
-Without these patches, long conversations fall back to local summarization (losing encrypted reasoning state) and the apply-patch tool uses standard JSON schema instead of the optimized grammar format.
+Without the first two patches, long conversations fall back to local summarization (losing encrypted reasoning state) and the apply-patch tool uses standard JSON schema instead of the optimized grammar format. The third is only needed for `webSearch: tool` (native search card).
 
 ## Patcher commands
 

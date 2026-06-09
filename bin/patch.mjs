@@ -37,6 +37,35 @@ const PATCHES = [
 			},
 		],
 	},
+	{
+		// Optional — only needed for `webSearch: tool` (native search-card UI).
+		// Redirects omp's built-in `codex` web-search provider to codex-lb when the
+		// plugin has published a web-search config on the global. Falls back to the
+		// official ChatGPT OAuth endpoint otherwise, so this is a no-op for users
+		// who don't enable it.
+		pkg: "@oh-my-pi/pi-coding-agent",
+		file: "src/web/search/providers/codex.ts",
+		replacements: [
+			{
+				label: "hasCodexSearch: enable codex-lb web search",
+				find: 'return authStorage.hasOAuth("openai-codex");',
+				replace:
+					'if ((globalThis as any)[Symbol.for("omp.codex-lb-responses.web-search")]) return true;\n\treturn authStorage.hasOAuth("openai-codex");',
+			},
+			{
+				label: "findCodexAuth: use codex-lb credentials",
+				find: 'const access = await authStorage.getOAuthAccess("openai-codex", sessionId, { signal });',
+				replace:
+					'const __ompCodexLb = (globalThis as any)[Symbol.for("omp.codex-lb-responses.web-search")];\n\tif (__ompCodexLb) return { accessToken: __ompCodexLb.apiKey, accountId: __ompCodexLb.accountId };\n\tconst access = await authStorage.getOAuthAccess("openai-codex", sessionId, { signal });',
+			},
+			{
+				label: "callCodexSearch: route to codex-lb base URL",
+				find: 'const url = `${CODEX_BASE_URL}${CODEX_RESPONSES_PATH}`;',
+				replace:
+					'const __ompCodexLbUrl = (globalThis as any)[Symbol.for("omp.codex-lb-responses.web-search")];\n\tconst url = __ompCodexLbUrl ? `${__ompCodexLbUrl.baseUrl}/responses` : `${CODEX_BASE_URL}${CODEX_RESPONSES_PATH}`;',
+			},
+		],
+	},
 ];
 
 function resolveGlobalNm() {
