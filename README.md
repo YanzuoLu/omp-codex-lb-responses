@@ -42,7 +42,9 @@ providers:
 
 ### `~/.omp/agent/config.yml`
 
-Enable WebSocket transport:
+Optional. The plugin already forces WebSocket for codex-lb providers, so this is
+**not required** for codex-lb — it only affects omp's built-in `openai-codex`
+provider. Harmless to set:
 
 ```yaml
 providers:
@@ -51,10 +53,16 @@ providers:
 
 ## What the plugin does
 
-- Intercepts `globalThis.fetch` — transparently upgrades SSE streaming requests to WebSocket for codex-lb compatibility
-- Intercepts `globalThis.WebSocket` — rewrites auth headers on WebSocket connections
-- Creates a synthetic JWT so omp's built-in Codex provider can initialize, then swaps it for the real API key before network I/O
-- Strips `chatgpt-account-id` header (codex-lb manages its own accounts)
+- **Forces WebSocket everywhere.** omp's native Codex WebSocket transport is the primary path (the plugin sets `preferWebsockets`). If omp ever falls back to SSE, the plugin upgrades that SSE request to WebSocket too — codex-lb needs WebSocket for session/account consistency.
+- Intercepts `globalThis.WebSocket` — rewrites auth headers on every WebSocket connection.
+- Intercepts `globalThis.fetch` / the per-request fetch — performs the SSE→WebSocket upgrade (detected on the synthetic token *before* it is swapped for the real key) and rewrites auth headers.
+- Creates a synthetic JWT so omp's built-in Codex provider can initialize, then swaps it for the real API key before network I/O.
+- Strips `chatgpt-account-id` header (codex-lb manages its own accounts).
+- **Auto-recovers.** omp permanently disables WebSocket for a session after one fatal failure (e.g. a slow handshake under load); the plugin re-enables it after a short cooldown so a single hiccup doesn't pin the whole session to the slower path.
+
+### Tuning the upgraded WebSocket (optional)
+
+The upgrade path bounds itself with a 10s connect timeout, a 60s first-event timeout, and a 300s idle timeout (idle measured from the last real event — `codex.keepalive` frames no longer reset it). These are constants in `src/index.ts`; omp's own native-transport timeouts are tunable via `PI_CODEX_WEBSOCKET_*` env vars (see omp docs).
 
 ## What the patcher does
 

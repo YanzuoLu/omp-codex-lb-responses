@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, test } from "bun:test";
 import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils/dirs";
-import codexLbResponses from "./index";
+import codexLbResponses, { createCodexLbFetch } from "./index";
 
 type ProviderConfig = {
 	baseUrl?: string;
@@ -184,5 +184,160 @@ describe("transport shim", () => {
 		expect(capturedHeaders.get("authorization")).toBe("Bearer sk-real-token");
 		expect(capturedHeaders.has("chatgpt-account-id")).toBe(false);
 		expect(capturedHeaders.has("x-omp-codex-lb-token")).toBe(false);
+	});
+});
+
+const SHIM_SYMBOL = Symbol.for("omp.codex-lb-responses.transport-shim");
+
+function shimTokens(): Map<string, string> {
+	const record = globalThis as typeof globalThis &
+		Record<symbol, { tokens: Map<string, string> } | undefined>;
+	let state = record[SHIM_SYMBOL];
+	if (!state) {
+		state = { tokens: new Map(), fetchInstalled: false, webSocketInstalled: false } as never;
+		record[SHIM_SYMBOL] = state;
+	}
+	return state.tokens;
+}
+
+class MockWebSocket extends EventTarget {
+	static CONNECTING = 0;
+	static OPEN = 1;
+	static CLOSING = 2;
+	static CLOSED = 3;
+	static instances: MockWebSocket[] = [];
+	url: string;
+	options: { headers?: Record<string, string> } | undefined;
+	binaryType = "";
+	readyState = MockWebSocket.CONNECTING;
+	sent: string[] = [];
+	constructor(url: string, options?: { headers?: Record<string, string> }) {
+		super();
+		this.url = url;
+		this.options = options;
+		MockWebSocket.instances.push(this);
+	}
+	send(data: string): void {
+		this.sent.push(data);
+	}
+	close(): void {
+		this.readyState = MockWebSocket.CLOSED;
+	}
+	fireOpen(): void {
+		this.readyState = MockWebSocket.OPEN;
+		this.dispatchEvent(new Event("open"));
+	}
+	fireMessage(data: string): void {
+		this.dispatchEvent(new MessageEvent("message", { data }));
+	}
+}
+
+describe("SSE→WebSocket upgrade", () => {
+	test("createCodexLbFetch upgrades codex-lb SSE to WebSocket before rewriting the bearer", async () => {
+		const FAKE = "header.payload.codexlb";
+		const REAL = "sk-clb-real-token";
+		shimTokens().set(FAKE, REAL);
+		const originalWebSocket = globalThis.WebSocket;
+		globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket;
+		MockWebSocket.instances = [];
+		try {
+			let baseFetchCalled = false;
+			const baseFetch = ((..._args: unknown[]) => {
+				baseFetchCalled = true;
+				return Promise.resolve(new Response(null));
+			}) as unknown as typeof fetch;
+			const lbFetch = createCodexLbFetch(baseFetch);
+
+			const responseP = lbFetch("https://lb.example/backend-api/codex/responses", {
+				method: "POST",
+				headers: {
+					authorization: `Bearer ${FAKE}`,
+					accept: "text/event-stream",
+					"content-type": "application/json",
+					"chatgpt-account-id": "fake-account",
+				},
+				body: JSON.stringify({ model: "gpt-5", input: [] }),
+			});
+
+			expect(MockWebSocket.instances.length).toBe(1);
+			const ws = MockWebSocket.instances[0]!;
+			expect(ws.url).toBe("wss://lb.example/backend-api/codex/responses");
+			const sentHeaders = new Headers(ws.options?.headers);
+			expect(sentHeaders.get("authorization")).toBe(`Bearer ${REAL}`);
+			expect(sentHeaders.has("chatgpt-account-id")).toBe(false);
+
+			ws.fireOpen();
+			const res = await responseP;
+			expect(baseFetchCalled).toBe(false);
+			expect(res.headers.get("content-type")).toContain("text/event-stream");
+			expect(ws.sent.length).toBe(1);
+			const sent = JSON.parse(ws.sent[0]!);
+			expect(sent.type).toBe("response.create");
+			expect(sent.model).toBe("gpt-5");
+
+			ws.fireMessage(JSON.stringify({ type: "response.output_text.delta", delta: "hi" }));
+			const reader = res.body!.getReader();
+			const { value } = await reader.read();
+			const chunk = new TextDecoder().decode(value);
+			expect(chunk).toContain("event: response.output_text.delta");
+
+			ws.fireMessage(JSON.stringify({ type: "response.completed" }));
+			expect(ws.readyState).toBe(MockWebSocket.CLOSED);
+		} finally {
+			globalThis.WebSocket = originalWebSocket;
+		}
+	});
+
+	test("upgraded stream filters codex.keepalive frames", async () => {
+		const FAKE = "header.payload.codexlb2";
+		const REAL = "sk-clb-real-2";
+		shimTokens().set(FAKE, REAL);
+		const originalWebSocket = globalThis.WebSocket;
+		globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket;
+		MockWebSocket.instances = [];
+		try {
+			const lbFetch = createCodexLbFetch(undefined);
+			const responseP = lbFetch("https://lb.example/backend-api/codex/responses", {
+				method: "POST",
+				headers: { authorization: `Bearer ${FAKE}`, accept: "text/event-stream" },
+				body: JSON.stringify({ model: "gpt-5" }),
+			});
+			const ws = MockWebSocket.instances[0]!;
+			ws.fireOpen();
+			const res = await responseP;
+			const reader = res.body!.getReader();
+			ws.fireMessage(JSON.stringify({ type: "codex.keepalive" }));
+			ws.fireMessage(JSON.stringify({ type: "response.output_text.delta", delta: "x" }));
+			const { value } = await reader.read();
+			const chunk = new TextDecoder().decode(value);
+			expect(chunk).toContain("event: response.output_text.delta");
+			expect(chunk).not.toContain("codex.keepalive");
+			ws.fireMessage(JSON.stringify({ type: "response.completed" }));
+		} finally {
+			globalThis.WebSocket = originalWebSocket;
+		}
+	});
+
+	test("createCodexLbFetch passes non-codex-lb requests through to the base fetch", async () => {
+		const originalWebSocket = globalThis.WebSocket;
+		globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket;
+		MockWebSocket.instances = [];
+		try {
+			let baseFetchCalled = false;
+			const baseFetch = ((..._args: unknown[]) => {
+				baseFetchCalled = true;
+				return Promise.resolve(new Response("ok"));
+			}) as unknown as typeof fetch;
+			const lbFetch = createCodexLbFetch(baseFetch);
+			await lbFetch("https://api.example/v1/chat", {
+				method: "POST",
+				headers: { authorization: "Bearer sk-not-codex-lb", accept: "text/event-stream" },
+				body: "{}",
+			});
+			expect(baseFetchCalled).toBe(true);
+			expect(MockWebSocket.instances.length).toBe(0);
+		} finally {
+			globalThis.WebSocket = originalWebSocket;
+		}
 	});
 });

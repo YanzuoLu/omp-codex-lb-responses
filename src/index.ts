@@ -280,10 +280,15 @@ function isCodexLbSseRequest(url: string, headers: Headers): boolean {
 	return accept.includes("text/event-stream");
 }
 
+const WS_PROXY_CONNECT_TIMEOUT_MS = 10_000;
+const WS_PROXY_FIRST_EVENT_TIMEOUT_MS = 60_000;
 const WS_PROXY_IDLE_TIMEOUT_MS = 300_000;
+const WS_PROXY_KEEPALIVE_EVENT = "codex.keepalive";
 const WS_PROXY_TERMINAL_EVENTS = new Set([
 	"response.completed", "response.done", "response.incomplete", "response.failed", "error",
 ]);
+const CODEX_PROVIDER_SESSION_STATE_KEY = "openai-codex-responses";
+const WS_RELATCH_COOLDOWN_MS = 30_000;
 
 function fetchViaWebSocket(url: string, init: RequestInit): Promise<Response> {
 	const headers = new Headers(init.headers);
@@ -304,11 +309,15 @@ function fetchViaWebSocket(url: string, init: RequestInit): Promise<Response> {
 		const signal = init.signal;
 		let settled = false;
 		let streamClosed = false;
-		let idleTimer: ReturnType<typeof setTimeout> | undefined;
+		let sawFirstEvent = false;
+		let lastProgressAt = 0;
+		let connectTimer: ReturnType<typeof setTimeout> | undefined;
+		let eventTimer: ReturnType<typeof setTimeout> | undefined;
 		let controllerRef: ReadableStreamDefaultController<Uint8Array> | undefined;
 
 		const teardown = () => {
-			if (idleTimer) { clearTimeout(idleTimer); idleTimer = undefined; }
+			if (connectTimer) { clearTimeout(connectTimer); connectTimer = undefined; }
+			if (eventTimer) { clearTimeout(eventTimer); eventTimer = undefined; }
 			signal?.removeEventListener("abort", onAbort);
 			if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
 				ws.close(1000, "teardown");
@@ -327,11 +336,19 @@ function fetchViaWebSocket(url: string, init: RequestInit): Promise<Response> {
 			}
 		};
 
-		const resetIdleTimer = () => {
-			if (idleTimer) clearTimeout(idleTimer);
-			idleTimer = setTimeout(() => {
-				closeStream(new Error("WebSocket proxy idle timeout"));
-			}, WS_PROXY_IDLE_TIMEOUT_MS);
+		// Two-phase liveness, mirroring omp's native WS transport: wait up to
+		// WS_PROXY_FIRST_EVENT_TIMEOUT_MS for the first frame, then enforce an idle
+		// ceiling measured from the last *progress* frame. codex.keepalive frames
+		// keep the socket alive server-side but are NOT progress — resetting the
+		// timer on them is what let a stuck upstream spin forever (the old bug).
+		const armEventTimer = () => {
+			if (eventTimer) clearTimeout(eventTimer);
+			const ms = sawFirstEvent
+				? Math.max(0, WS_PROXY_IDLE_TIMEOUT_MS - (Date.now() - lastProgressAt))
+				: WS_PROXY_FIRST_EVENT_TIMEOUT_MS;
+			eventTimer = setTimeout(() => {
+				closeStream(new Error(sawFirstEvent ? "WebSocket proxy idle timeout" : "WebSocket proxy first-event timeout"));
+			}, ms);
 		};
 
 		const onAbort = () => {
@@ -345,7 +362,15 @@ function fetchViaWebSocket(url: string, init: RequestInit): Promise<Response> {
 		};
 		signal?.addEventListener("abort", onAbort);
 
+		connectTimer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			teardown();
+			reject(new Error("WebSocket proxy connect timeout"));
+		}, WS_PROXY_CONNECT_TIMEOUT_MS);
+
 		ws.addEventListener("open", () => {
+			if (connectTimer) { clearTimeout(connectTimer); connectTimer = undefined; }
 			let body: Record<string, unknown>;
 			try {
 				body = JSON.parse(init.body as string);
@@ -357,7 +382,8 @@ function fetchViaWebSocket(url: string, init: RequestInit): Promise<Response> {
 			}
 			body.type = "response.create";
 			ws.send(JSON.stringify(body));
-			resetIdleTimer();
+			lastProgressAt = Date.now();
+			armEventTimer();
 
 			const encoder = new TextEncoder();
 			const stream = new ReadableStream<Uint8Array>({
@@ -365,14 +391,24 @@ function fetchViaWebSocket(url: string, init: RequestInit): Promise<Response> {
 					controllerRef = controller;
 					ws.addEventListener("message", (event: MessageEvent) => {
 						if (streamClosed) return;
-						resetIdleTimer();
 						const text = typeof event.data === "string"
 							? event.data
 							: Buffer.isBuffer(event.data) ? event.data.toString("utf8") : String(event.data);
 						let parsed: Record<string, unknown>;
 						try { parsed = JSON.parse(text); } catch { return; }
 						const eventType = typeof parsed.type === "string" ? parsed.type : "";
-						if (!eventType || eventType === "codex.keepalive") return;
+						const isKeepalive = eventType === WS_PROXY_KEEPALIVE_EVENT;
+						// Any frame ends the first-event phase; only progress (non-keepalive)
+						// frames reset the idle window so keepalive-only streams still time out.
+						if (!sawFirstEvent) {
+							sawFirstEvent = true;
+							if (!isKeepalive) lastProgressAt = Date.now();
+							armEventTimer();
+						} else if (!isKeepalive) {
+							lastProgressAt = Date.now();
+							armEventTimer();
+						}
+						if (!eventType || isKeepalive) return;
 						const sseChunk = `event: ${eventType}\ndata: ${text}\n\n`;
 						try { controller.enqueue(encoder.encode(sseChunk)); } catch { return; }
 						if (WS_PROXY_TERMINAL_EVENTS.has(eventType)) {
@@ -472,15 +508,52 @@ function resolveRealApiKey(apiKey: string): string {
 	return getShimState().tokens.get(apiKey) ?? apiKey;
 }
 
-function createCodexLbFetch(fetchOverride: typeof fetch | undefined): typeof fetch {
+/** @internal Exported for tests. */
+export function createCodexLbFetch(fetchOverride: typeof fetch | undefined): typeof fetch {
 	const baseFetch = fetchOverride ?? fetch;
-	const lbFetch = ((input: RequestInfo | URL, init?: RequestInit) =>
-		baseFetch(input, init ? { ...init, headers: rewriteCodexLbHeaders(init.headers) } : init)) as typeof fetch;
+	const lbFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+		// Upgrade codex-lb SSE → WebSocket HERE, before rewriting the bearer.
+		// The fake token is the only marker identifying a codex-lb request;
+		// rewriteCodexLbHeaders (the line below, and the global fetch shim) swaps
+		// it for the real token, after which isCodexLbSseRequest() can no longer
+		// recognize it — which is why the upgrade never fired on omp's native SSE
+		// fallback and those turns silently dropped to plain SSE.
+		if (init?.body) {
+			const url = input instanceof Request ? input.url : input.toString();
+			const headers = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined));
+			if (isCodexLbSseRequest(url, headers)) {
+				return fetchViaWebSocket(url, init);
+			}
+		}
+		return baseFetch(input, init ? { ...init, headers: rewriteCodexLbHeaders(init.headers) } : init);
+	}) as typeof fetch;
 	const preconnect = (baseFetch as typeof fetch & { preconnect?: unknown }).preconnect;
 	if (typeof preconnect === "function") {
 		(lbFetch as typeof fetch & { preconnect?: unknown }).preconnect = preconnect.bind(baseFetch);
 	}
 	return lbFetch;
+}
+
+type CodexWsSessionLike = { disableWebsocket?: boolean; lastFallbackAt?: number };
+type CodexProviderStateLike = { webSocketSessions?: Map<string, CodexWsSessionLike> };
+
+function reenableNativeWebSocket(providerSessionState: unknown): void {
+	// omp latches `disableWebsocket` on the first fatal WS failure (e.g. a 10s
+	// connect timeout under codex-lb load) and never clears it, so one transient
+	// hiccup pins the whole session to the slower SSE→WS path and loses native
+	// connection reuse / turn-state affinity. Clear the latch after a cooldown so
+	// the robust native transport is retried. Reaches into omp internals on
+	// purpose; guarded so an upstream rename degrades to a no-op.
+	if (!(providerSessionState instanceof Map)) return;
+	const codexState = providerSessionState.get(CODEX_PROVIDER_SESSION_STATE_KEY) as CodexProviderStateLike | undefined;
+	const sessions = codexState?.webSocketSessions;
+	if (!sessions || typeof sessions.values !== "function") return;
+	const now = Date.now();
+	for (const session of sessions.values()) {
+		if (session?.disableWebsocket === true && now - (session.lastFallbackAt ?? 0) >= WS_RELATCH_COOLDOWN_MS) {
+			session.disableWebsocket = false;
+		}
+	}
 }
 
 function streamCodexLb(
@@ -498,6 +571,8 @@ function streamCodexLb(
 
 	const innerModel = { ...model, api: CODEX_API, headers: model.headers } as Model<"openai-codex-responses">;
 	const codexOptions = options as SimpleStreamOptions | undefined;
+	const providerSessionState = codexOptions?.providerSessionState ?? new Map();
+	reenableNativeWebSocket(providerSessionState);
 	const ensuredSessionId = codexOptions?.sessionId ?? randomUUID();
 	const innerApiKey = createFakeApiKey(model.provider, model.baseUrl ?? "", realApiKey);
 
@@ -506,7 +581,7 @@ function streamCodexLb(
 		apiKey: innerApiKey,
 		sessionId: ensuredSessionId,
 		promptCacheKey: codexOptions?.promptCacheKey ?? codexOptions?.sessionId ?? ensuredSessionId,
-		providerSessionState: codexOptions?.providerSessionState ?? new Map(),
+		providerSessionState,
 		preferWebsockets: true,
 		reasoning: codexOptions?.disableReasoning ? "none" : codexOptions?.reasoning as OpenAICodexResponsesOptions["reasoning"],
 		reasoningSummary: codexOptions?.hideThinkingSummary ? null : undefined,
