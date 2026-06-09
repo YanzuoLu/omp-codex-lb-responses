@@ -77,6 +77,23 @@ const PATCHES = [
 			},
 		],
 	},
+	{
+		// Auto-recover from codex-lb's non-standard stale-previous_response_id error.
+		// codex-lb returns code `codex_previous_response_stale` / "Upstream previous
+		// response anchor expired; retry without previous_response_id.", but omp only
+		// recognizes the standard `previous_response_not_found`, so the turn fails
+		// instead of transparently retrying with full context. Helps all codex-lb users.
+		pkg: "@oh-my-pi/pi-ai",
+		file: "src/providers/openai-codex-responses.ts",
+		replacements: [
+			{
+				label: "isCodexPreviousResponseNotFound: also match codex-lb stale anchor",
+				find: 'return error instanceof CodexProviderStreamError && error.code === "previous_response_not_found";',
+				replace:
+					'return error instanceof CodexProviderStreamError && (error.code === "previous_response_not_found" || error.code === "codex_previous_response_stale" || /previous_response_not_found|codex_previous_response_stale|previous response anchor expired|retry without previous_response_id/i.test(error.message));',
+			},
+		],
+	},
 ];
 
 function resolveGlobalNm() {
