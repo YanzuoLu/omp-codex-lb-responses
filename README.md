@@ -30,6 +30,7 @@ providers:
     apiKey: sk-clb-your-token
     api: openai-codex-responses
     auth: apiKey
+    webSearch: true          # optional — Codex-style hosted web search (see "Web search" below)
     models:
       - id: gpt-5.5
         name: gpt-5.5
@@ -50,6 +51,23 @@ provider. Harmless to set:
 providers:
   openaiWebsockets: "on"
 ```
+
+## Web search (optional)
+
+Set `webSearch: true` on a codex-lb provider to get Codex-CLI-style web search:
+the plugin injects the hosted `web_search` tool into the model's `response.create`
+frame, so the search runs **server-side on your codex-lb account** — no separate
+search API key and no `/login openai-codex` OAuth.
+
+- It replaces omp's client-side `web_search` function tool (the one gated behind
+  `providers.webSearch` / ChatGPT OAuth) for these providers, so the model
+  searches through codex-lb instead of omp's own search provider.
+- **Caveat:** omp does not render the hosted search's step UI or structured
+  citations — the answer is web-informed and usually includes inline source URLs,
+  but there's no "Searching…" tool card. (omp ignores the `web_search_call`
+  stream events, but keeps the item in history, so multi-turn stays consistent.)
+- Requires that your codex-lb account/plan actually has web search — the same one
+  the Codex CLI uses.
 
 ## What the plugin does
 

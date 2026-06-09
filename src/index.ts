@@ -52,19 +52,22 @@ type RawProvider = {
 	authHeader?: unknown;
 	models?: unknown;
 	compat?: unknown;
+	webSearch?: unknown;
 };
 type ModelsConfig = { providers?: Record<string, RawProvider> };
 type ShimState = {
 	tokens: Map<string, string>;
 	fetchInstalled: boolean;
 	webSocketInstalled: boolean;
+	/** ws/wss URL prefixes of codex-lb providers that opted into hosted web search. */
+	webSearchWsPrefixes: Set<string>;
 };
 
 function getShimState(): ShimState {
 	const globalRecord = globalThis as typeof globalThis & Record<symbol, ShimState | undefined>;
 	let state = globalRecord[SHIM_KEY];
 	if (!state) {
-		state = { tokens: new Map(), fetchInstalled: false, webSocketInstalled: false };
+		state = { tokens: new Map(), fetchInstalled: false, webSocketInstalled: false, webSearchWsPrefixes: new Set() };
 		globalRecord[SHIM_KEY] = state;
 	}
 	return state;
@@ -226,6 +229,7 @@ function discoverCodexLbProviders(): Array<{
 	authHeader?: boolean;
 	models: Array<Record<string, unknown>>;
 	compat?: Record<string, unknown>;
+	webSearch: boolean;
 }> {
 	const providers = readModelsConfig()?.providers;
 	if (!providers) return [];
@@ -249,6 +253,7 @@ function discoverCodexLbProviders(): Array<{
 			authHeader: typeof provider.authHeader === "boolean" ? provider.authHeader : undefined,
 			models,
 			compat: asPlainRecord(provider.compat),
+			webSearch: provider.webSearch === true,
 		});
 	}
 	return discovered;
@@ -477,6 +482,63 @@ function installCodexLbFetchShim(): void {
 	state.fetchInstalled = true;
 }
 
+const WEB_SEARCH_TOOL_TYPES = new Set(["web_search", "web_search_preview"]);
+
+/**
+ * Injects the hosted `web_search` tool into a `response.create` frame — the same
+ * thing the Codex CLI sends, which codex-lb forwards to the upstream ChatGPT
+ * account. Returns the rewritten JSON, or undefined when nothing changed (not a
+ * response.create, unparseable, or web search already present). omp's stream
+ * handler tolerates the resulting `web_search_call` events (it stores the item
+ * for history and ignores the rest), so the model's answer is web-informed even
+ * though omp does not render the search-step UI.
+ */
+export function injectWebSearchTool(payload: string): string | undefined {
+	let body: Record<string, unknown>;
+	try {
+		body = JSON.parse(payload);
+	} catch {
+		return undefined;
+	}
+	if (!body || body.type !== "response.create") return undefined;
+	const tools = Array.isArray(body.tools) ? (body.tools as Array<Record<string, unknown>>) : [];
+	// Already carries the hosted tool — leave it untouched.
+	if (tools.some(tool => tool && typeof tool === "object" && WEB_SEARCH_TOOL_TYPES.has(tool.type as string))) {
+		return undefined;
+	}
+	// Drop omp's client-side `web_search` FUNCTION tool if present: it would both
+	// duplicate the hosted tool and route the model's calls through omp's
+	// OAuth-gated client search provider. Replacing it with the hosted tool makes
+	// the search run server-side under the codex-lb account.
+	const filtered = tools.filter(
+		tool =>
+			!(tool && typeof tool === "object" && tool.type === "function" && WEB_SEARCH_TOOL_TYPES.has(tool.name as string)),
+	);
+	body.tools = [...filtered, { type: "web_search" }];
+	return JSON.stringify(body);
+}
+
+function shouldInjectWebSearch(url: string): boolean {
+	const prefixes = getShimState().webSearchWsPrefixes;
+	for (const prefix of prefixes) {
+		if (url.startsWith(prefix)) return true;
+	}
+	return false;
+}
+
+function wrapWebSocketSendForWebSearch(socket: unknown): void {
+	const target = socket as { send?: (data: unknown) => unknown };
+	if (typeof target.send !== "function") return;
+	const send = target.send.bind(target);
+	target.send = (data: unknown) => {
+		if (typeof data === "string") {
+			const injected = injectWebSearchTool(data);
+			if (injected !== undefined) return send(injected);
+		}
+		return send(data);
+	};
+}
+
 function installCodexLbWebSocketShim(): void {
 	const state = getShimState();
 	if (state.webSocketInstalled) return;
@@ -493,7 +555,12 @@ function installCodexLbWebSocketShim(): void {
 					(nextOptions as { headers?: HeadersInit }).headers,
 				);
 			}
-			return Reflect.construct(target, [url, nextOptions, ...rest], newTarget);
+			const instance = Reflect.construct(target, [url, nextOptions, ...rest], newTarget);
+			const urlString = typeof url === "string" ? url : ((url as { toString?: () => string })?.toString?.() ?? "");
+			if (shouldInjectWebSearch(urlString)) {
+				wrapWebSocketSendForWebSearch(instance);
+			}
+			return instance;
 		},
 	}) as typeof WebSocket;
 	state.webSocketInstalled = true;
@@ -628,6 +695,9 @@ export default function codexLbResponses(pi: ExtensionApi): void {
 
 	for (const provider of discoverCodexLbProviders()) {
 		getShimState().tokens.set(provider.fakeApiKey, provider.realApiKey);
+		if (provider.webSearch) {
+			getShimState().webSearchWsPrefixes.add(toWsUrl(provider.baseUrl.replace(/\/+$/, "")));
+		}
 		pi.registerProvider(provider.name, {
 			baseUrl: provider.baseUrl,
 			apiKey: provider.fakeApiKey,
