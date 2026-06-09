@@ -79,6 +79,23 @@ providers:
 export PI_CODEX_WEB_SEARCH_MODEL=gpt-5.5
 ```
 
+By default the search request mirrors what the Codex CLI sends: `search_context_size: medium`, the same `web_search` tool spec, **reasoning matched to your main model**, and a **180s** hard timeout. (codex-lb generates slowly — the lookup is fast but the model's summary can take ~100s; omp's old 60s default aborted it. Codex itself is just as slow but doesn't abort, because its web search runs inside the main turn with no 60s tool cap.) Tune per provider:
+
+```yaml
+# ~/.omp/agent/models.yml  (under the provider)
+webSearch: tool
+webSearchOptions:            # all optional
+  contextSize: medium        # low | medium | high  (default: medium)
+  reasoningEffort: auto      # auto = match the main model each turn; or none|minimal|low|medium|high|xhigh
+  timeoutSeconds: 180        # search hard timeout (default: 180)
+  userLocationCountry: US    # user_location.country (default: US; "none" to omit)
+  tool:                      # optional: full web_search tool object — overrides everything above
+    type: web_search
+    return_token_budget: default
+    search_context_size: medium
+    user_location: { type: approximate, country: US }
+```
+
 ### `webSearch: inject` — no patch, no UI
 
 Plugin-only. The plugin injects the hosted `web_search` tool into the model's

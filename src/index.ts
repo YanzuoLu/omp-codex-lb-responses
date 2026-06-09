@@ -54,6 +54,7 @@ type RawProvider = {
 	models?: unknown;
 	compat?: unknown;
 	webSearch?: unknown;
+	webSearchOptions?: unknown;
 };
 type ModelsConfig = { providers?: Record<string, RawProvider> };
 type ShimState = {
@@ -222,7 +223,19 @@ function normalizeModel(model: RawModel): Record<string, unknown> | undefined {
 }
 
 type WebSearchMode = "off" | "inject" | "tool";
-type CodexLbWebSearchConfig = { baseUrl: string; apiKey: string; accountId: string };
+type CodexLbWebSearchConfig = {
+	baseUrl: string;
+	apiKey: string;
+	accountId: string;
+	/** web_search tool object the patched search provider sends (Codex-aligned). */
+	searchTool: Record<string, unknown>;
+	/** reasoning effort for the search sub-request; undefined when auto-tracking. */
+	reasoningEffort?: string;
+	/** when true, reasoningEffort is kept in sync with the main model each turn. */
+	reasoningAuto: boolean;
+	/** hard timeout for the search request, in ms. */
+	searchTimeoutMs: number;
+};
 
 function parseWebSearchMode(value: unknown): WebSearchMode {
 	if (value === true || value === "inject") return "inject";
@@ -230,15 +243,61 @@ function parseWebSearchMode(value: unknown): WebSearchMode {
 	return "off";
 }
 
+const SEARCH_CONTEXT_SIZES = new Set(["low", "medium", "high"]);
+
 /**
- * Publishes the codex-lb endpoint + synthetic key for the patched omp `codex`
- * search provider (see bin/patch.mjs) to read, so omp's native web-search card
- * runs through codex-lb (over WebSocket, via the fetch shim) instead of the
- * official ChatGPT OAuth endpoint. First `tool`-mode provider wins.
+ * Builds the codex-lb web-search config from a provider's `webSearchOptions`,
+ * defaulting to Codex CLI's captured request shape: medium context, the
+ * web_search tool spec, a 180s timeout, and reasoning matched to the main model.
+ */
+function buildCodexLbWebSearchConfig(
+	baseUrl: string,
+	fakeApiKey: string,
+	accountId: string,
+	rawOptions: unknown,
+): CodexLbWebSearchConfig {
+	const opts = asPlainRecord(rawOptions) ?? {};
+	const contextSize =
+		typeof opts.contextSize === "string" && SEARCH_CONTEXT_SIZES.has(opts.contextSize) ? opts.contextSize : "medium";
+	const country = typeof opts.userLocationCountry === "string" ? opts.userLocationCountry.trim() : "US";
+	const toolOverride = asPlainRecord(opts.tool);
+	const searchTool: Record<string, unknown> = toolOverride ?? {
+		type: "web_search",
+		return_token_budget: "default",
+		search_context_size: contextSize,
+		...(country && country.toLowerCase() !== "none" ? { user_location: { type: "approximate", country } } : {}),
+	};
+	const reasoningRaw = typeof opts.reasoningEffort === "string" ? opts.reasoningEffort.trim() : "auto";
+	const reasoningAuto = reasoningRaw === "" || reasoningRaw === "auto";
+	return {
+		baseUrl,
+		apiKey: fakeApiKey,
+		accountId,
+		searchTool,
+		reasoningEffort: reasoningAuto ? undefined : reasoningRaw,
+		reasoningAuto,
+		searchTimeoutMs: asPositiveNumber(opts.timeoutSeconds, 180) * 1000,
+	};
+}
+
+/**
+ * Publishes the codex-lb web-search config for the patched omp `codex` search
+ * provider (see bin/patch.mjs) to read, so omp's native web-search card runs
+ * through codex-lb (over WebSocket, via the fetch shim) instead of the official
+ * ChatGPT OAuth endpoint. First `tool`-mode provider wins.
  */
 function setCodexLbWebSearchConfig(config: CodexLbWebSearchConfig): void {
 	const record = globalThis as typeof globalThis & Record<symbol, CodexLbWebSearchConfig | undefined>;
 	if (!record[WEB_SEARCH_CONFIG_KEY]) record[WEB_SEARCH_CONFIG_KEY] = config;
+}
+
+/** Keep the search sub-request's reasoning effort in sync with the main model. */
+function trackMainModelReasoning(effort: unknown): void {
+	const record = globalThis as typeof globalThis & Record<symbol, CodexLbWebSearchConfig | undefined>;
+	const config = record[WEB_SEARCH_CONFIG_KEY];
+	if (config?.reasoningAuto && typeof effort === "string" && effort.length > 0) {
+		config.reasoningEffort = effort;
+	}
 }
 
 function discoverCodexLbProviders(): Array<{
@@ -251,6 +310,7 @@ function discoverCodexLbProviders(): Array<{
 	models: Array<Record<string, unknown>>;
 	compat?: Record<string, unknown>;
 	webSearch: WebSearchMode;
+	webSearchOptions?: Record<string, unknown>;
 }> {
 	const providers = readModelsConfig()?.providers;
 	if (!providers) return [];
@@ -275,6 +335,7 @@ function discoverCodexLbProviders(): Array<{
 			models,
 			compat: asPlainRecord(provider.compat),
 			webSearch: parseWebSearchMode(provider.webSearch),
+			webSearchOptions: asPlainRecord(provider.webSearchOptions),
 		});
 	}
 	return discovered;
@@ -661,6 +722,7 @@ function streamCodexLb(
 	const codexOptions = options as SimpleStreamOptions | undefined;
 	const providerSessionState = codexOptions?.providerSessionState ?? new Map();
 	reenableNativeWebSocket(providerSessionState);
+	trackMainModelReasoning(codexOptions?.disableReasoning ? "none" : codexOptions?.reasoning);
 	const ensuredSessionId = codexOptions?.sessionId ?? randomUUID();
 	const innerApiKey = createFakeApiKey(model.provider, model.baseUrl ?? "", realApiKey);
 
@@ -724,11 +786,14 @@ export default function codexLbResponses(pi: ExtensionApi): void {
 			// fetch shim recognizes it and upgrades it to WebSocket (rewriting auth
 			// + the openai-beta header). codex-lb's SSE path is unreliable (upstream
 			// 1011s), so the search MUST ride the same WS transport as everything else.
-			setCodexLbWebSearchConfig({
-				baseUrl: provider.baseUrl.replace(/\/+$/, ""),
-				apiKey: provider.fakeApiKey,
-				accountId: createFakeAccountId(provider.name, provider.baseUrl, provider.realApiKey),
-			});
+			setCodexLbWebSearchConfig(
+				buildCodexLbWebSearchConfig(
+					provider.baseUrl.replace(/\/+$/, ""),
+					provider.fakeApiKey,
+					createFakeAccountId(provider.name, provider.baseUrl, provider.realApiKey),
+					provider.webSearchOptions,
+				),
+			);
 		}
 		pi.registerProvider(provider.name, {
 			baseUrl: provider.baseUrl,

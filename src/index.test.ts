@@ -443,38 +443,77 @@ describe("hosted web_search injection", () => {
 	});
 });
 
+type PublishedWebSearchConfig = {
+	baseUrl: string;
+	apiKey: string;
+	accountId: string;
+	searchTool: Record<string, unknown>;
+	reasoningEffort?: string;
+	reasoningAuto: boolean;
+	searchTimeoutMs: number;
+};
+
+const WS_CONFIG_KEY = Symbol.for("omp.codex-lb-responses.web-search");
+
+function publishWebSearchConfig(yml: string): PublishedWebSearchConfig | undefined {
+	const agentDir = mkdtempSync(join(tmpdir(), "codex-lb-tool-"));
+	writeFileSync(join(agentDir, "models.yml"), yml);
+	const previousAgentDir = getAgentDir();
+	const g = globalThis as typeof globalThis & Record<symbol, PublishedWebSearchConfig | { webSearchWsPrefixes?: Set<string> } | undefined>;
+	g[WS_CONFIG_KEY] = undefined;
+	(g[SHIM_SYMBOL] as { webSearchWsPrefixes?: Set<string> } | undefined)?.webSearchWsPrefixes?.clear();
+	try {
+		setAgentDir(agentDir);
+		codexLbResponses({ registerProvider() {} });
+		return g[WS_CONFIG_KEY] as PublishedWebSearchConfig | undefined;
+	} finally {
+		setAgentDir(previousAgentDir);
+		g[WS_CONFIG_KEY] = undefined;
+	}
+}
+
 describe("codex-lb web-search tool mode", () => {
-	test("webSearch: tool publishes the codex-lb web-search config and does not inject", () => {
-		const agentDir = mkdtempSync(join(tmpdir(), "codex-lb-tool-"));
-		writeFileSync(
-			join(agentDir, "models.yml"),
+	test("publishes a Codex-aligned config by default and does not inject", () => {
+		const cfg = publishWebSearchConfig(
 			`providers:\n  codex-lb:\n    baseUrl: https://lb.example/backend-api/codex/\n    apiKey: sk-real-token\n    api: openai-codex-responses\n    webSearch: tool\n    models:\n      - id: gpt-5\n`,
-		);
-		const previousAgentDir = getAgentDir();
-		const wsKey = Symbol.for("omp.codex-lb-responses.web-search");
-		const shimKey = Symbol.for("omp.codex-lb-responses.transport-shim");
-		const g = globalThis as typeof globalThis &
-			Record<symbol, { baseUrl?: string; apiKey?: string; accountId?: string } | { webSearchWsPrefixes?: Set<string> } | undefined>;
-		const prevConfig = g[wsKey];
-		try {
-			setAgentDir(agentDir);
-			g[wsKey] = undefined;
-			(g[shimKey] as { webSearchWsPrefixes?: Set<string> } | undefined)?.webSearchWsPrefixes?.clear();
-			codexLbResponses({ registerProvider() {} });
-			const cfg = g[wsKey] as { baseUrl: string; apiKey: string; accountId: string };
-			expect(cfg).toBeDefined();
-			expect(cfg.baseUrl).toBe("https://lb.example/backend-api/codex"); // trailing slash stripped
-			// synthetic JWT (not the real key) so the fetch shim upgrades the search to WebSocket
-			expect(cfg.apiKey).not.toBe("sk-real-token");
-			expect(cfg.apiKey.split(".").length).toBe(3);
-			expect(typeof cfg.accountId).toBe("string");
-			expect(cfg.accountId.length).toBeGreaterThan(0);
-			// tool mode must NOT register an injection prefix
-			const prefixes = (g[shimKey] as { webSearchWsPrefixes?: Set<string> } | undefined)?.webSearchWsPrefixes;
-			expect(prefixes?.size ?? 0).toBe(0);
-		} finally {
-			setAgentDir(previousAgentDir);
-			g[wsKey] = prevConfig;
-		}
+		)!;
+		expect(cfg).toBeDefined();
+		expect(cfg.baseUrl).toBe("https://lb.example/backend-api/codex"); // trailing slash stripped
+		// synthetic JWT (not the real key) so the fetch shim upgrades the search to WebSocket
+		expect(cfg.apiKey).not.toBe("sk-real-token");
+		expect(cfg.apiKey.split(".").length).toBe(3);
+		expect(cfg.accountId.length).toBeGreaterThan(0);
+		// Codex-aligned default web_search tool
+		expect(cfg.searchTool.type).toBe("web_search");
+		expect(cfg.searchTool.search_context_size).toBe("medium");
+		expect(cfg.searchTool.return_token_budget).toBe("default");
+		expect((cfg.searchTool.user_location as { country?: string }).country).toBe("US");
+		// reasoning auto-tracks the main model by default
+		expect(cfg.reasoningAuto).toBe(true);
+		expect(cfg.reasoningEffort).toBeUndefined();
+		expect(cfg.searchTimeoutMs).toBe(180_000);
+		// tool mode must NOT register an injection prefix
+		const g = globalThis as typeof globalThis & Record<symbol, { webSearchWsPrefixes?: Set<string> } | undefined>;
+		expect((g[SHIM_SYMBOL]?.webSearchWsPrefixes?.size ?? 0)).toBe(0);
+	});
+
+	test("honors webSearchOptions overrides", () => {
+		const cfg = publishWebSearchConfig(
+			`providers:\n  codex-lb:\n    baseUrl: https://lb.example/backend-api/codex\n    apiKey: sk-real-token\n    api: openai-codex-responses\n    webSearch: tool\n    webSearchOptions:\n      contextSize: high\n      reasoningEffort: xhigh\n      timeoutSeconds: 240\n      userLocationCountry: none\n    models:\n      - id: gpt-5\n`,
+		)!;
+		expect(cfg.searchTool.search_context_size).toBe("high");
+		expect(cfg.searchTool.user_location).toBeUndefined(); // country: none → omitted
+		expect(cfg.reasoningAuto).toBe(false);
+		expect(cfg.reasoningEffort).toBe("xhigh");
+		expect(cfg.searchTimeoutMs).toBe(240_000);
+	});
+
+	test("a raw tool override replaces the built web_search spec verbatim", () => {
+		const cfg = publishWebSearchConfig(
+			`providers:\n  codex-lb:\n    baseUrl: https://lb.example/backend-api/codex\n    apiKey: sk-real-token\n    api: openai-codex-responses\n    webSearch: tool\n    webSearchOptions:\n      tool:\n        type: web_search\n        external_web_access: false\n        search_content_types: [text, image]\n    models:\n      - id: gpt-5\n`,
+		)!;
+		expect(cfg.searchTool.external_web_access).toBe(false);
+		expect(cfg.searchTool.search_content_types).toEqual(["text", "image"]);
+		expect(cfg.searchTool.return_token_budget).toBeUndefined(); // override replaces, no merge
 	});
 });

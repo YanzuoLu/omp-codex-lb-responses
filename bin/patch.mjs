@@ -64,6 +64,17 @@ const PATCHES = [
 				replace:
 					'const __ompCodexLbUrl = (globalThis as any)[Symbol.for("omp.codex-lb-responses.web-search")];\n\tconst url = __ompCodexLbUrl ? `${__ompCodexLbUrl.baseUrl}/responses` : `${CODEX_BASE_URL}${CODEX_RESPONSES_PATH}`;',
 			},
+			{
+				label: "callCodexSearch: apply codex-lb web_search tool + reasoning",
+				find: 'const fetchImpl = options.fetch ?? fetch;',
+				replace:
+					'if (__ompCodexLbUrl) {\n\t\tif (__ompCodexLbUrl.searchTool) body.tools = [__ompCodexLbUrl.searchTool];\n\t\tif (__ompCodexLbUrl.reasoningEffort) body.reasoning = { effort: __ompCodexLbUrl.reasoningEffort };\n\t}\n\tconst fetchImpl = options.fetch ?? fetch;',
+			},
+			{
+				label: "callCodexSearch: use codex-lb search timeout",
+				find: 'signal: withHardTimeout(options.signal),',
+				replace: 'signal: withHardTimeout(options.signal, __ompCodexLbUrl?.searchTimeoutMs),',
+			},
 		],
 	},
 ];
