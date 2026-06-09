@@ -464,7 +464,9 @@ describe("codex-lb web-search tool mode", () => {
 			const cfg = g[wsKey] as { baseUrl: string; apiKey: string; accountId: string };
 			expect(cfg).toBeDefined();
 			expect(cfg.baseUrl).toBe("https://lb.example/backend-api/codex"); // trailing slash stripped
-			expect(cfg.apiKey).toBe("sk-real-token"); // real key, not the synthetic JWT
+			// synthetic JWT (not the real key) so the fetch shim upgrades the search to WebSocket
+			expect(cfg.apiKey).not.toBe("sk-real-token");
+			expect(cfg.apiKey.split(".").length).toBe(3);
 			expect(typeof cfg.accountId).toBe("string");
 			expect(cfg.accountId.length).toBeGreaterThan(0);
 			// tool mode must NOT register an injection prefix

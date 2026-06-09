@@ -231,10 +231,10 @@ function parseWebSearchMode(value: unknown): WebSearchMode {
 }
 
 /**
- * Publishes the codex-lb endpoint + real key for the patched omp `codex` search
- * provider (see bin/patch.mjs) to read, so omp's native web-search card runs
- * through codex-lb instead of the official ChatGPT OAuth endpoint. First
- * `tool`-mode provider wins.
+ * Publishes the codex-lb endpoint + synthetic key for the patched omp `codex`
+ * search provider (see bin/patch.mjs) to read, so omp's native web-search card
+ * runs through codex-lb (over WebSocket, via the fetch shim) instead of the
+ * official ChatGPT OAuth endpoint. First `tool`-mode provider wins.
  */
 function setCodexLbWebSearchConfig(config: CodexLbWebSearchConfig): void {
 	const record = globalThis as typeof globalThis & Record<symbol, CodexLbWebSearchConfig | undefined>;
@@ -719,9 +719,14 @@ export default function codexLbResponses(pi: ExtensionApi): void {
 		if (provider.webSearch === "inject") {
 			getShimState().webSearchWsPrefixes.add(toWsUrl(provider.baseUrl.replace(/\/+$/, "")));
 		} else if (provider.webSearch === "tool") {
+			// Publish the SYNTHETIC key, not the real one. The patched codex search
+			// provider sends an SSE request; with the synthetic bearer the global
+			// fetch shim recognizes it and upgrades it to WebSocket (rewriting auth
+			// + the openai-beta header). codex-lb's SSE path is unreliable (upstream
+			// 1011s), so the search MUST ride the same WS transport as everything else.
 			setCodexLbWebSearchConfig({
 				baseUrl: provider.baseUrl.replace(/\/+$/, ""),
-				apiKey: provider.realApiKey,
+				apiKey: provider.fakeApiKey,
 				accountId: createFakeAccountId(provider.name, provider.baseUrl, provider.realApiKey),
 			});
 		}
