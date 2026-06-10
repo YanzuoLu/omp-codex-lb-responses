@@ -128,7 +128,7 @@ Two checks in omp are hardcoded to `model.provider === "openai-codex"` and canno
 | Remote compaction | `pi-agent-core/.../compaction/openai.ts` | Also accept `model.api === "openai-codex-responses"` |
 | Freeform apply-patch | `pi-ai/.../model-thinking.ts` | Gate on `model.api` alone, not `model.provider` |
 | Web search → codex-lb *(optional)* | `pi-coding-agent/.../web/search/providers/codex.ts` | Route omp's `codex` search provider to codex-lb when a provider sets `webSearch: tool`. No-op (falls back to official OAuth) when unset. |
-| Stale `previous_response_id` recovery | `pi-ai/.../openai-codex-responses.ts` | Treat codex-lb's `codex_previous_response_stale` ("anchor expired") as a retry-without-`previous_response_id` signal, so omp transparently retries with full context instead of failing the turn |
+| Stale `previous_response_id` recovery | `pi-ai/.../openai-codex-responses.ts` | Treat codex-lb's `codex_previous_response_stale` ("anchor expired") and upstream's "No tool call found for function call output with call_id …" (codex-lb replayed a turn upstream and the pinned downstream response id no longer matches the response holding the tool calls) as retry-without-`previous_response_id` signals, so omp transparently retries with full context instead of failing the turn |
 
 Without the first two patches, long conversations fall back to local summarization (losing encrypted reasoning state) and the apply-patch tool uses standard JSON schema instead of the optimized grammar format. The third is only needed for `webSearch: tool` (native search card).
 

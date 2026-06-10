@@ -78,11 +78,17 @@ const PATCHES = [
 		],
 	},
 	{
-		// Auto-recover from codex-lb's non-standard stale-previous_response_id error.
-		// codex-lb returns code `codex_previous_response_stale` / "Upstream previous
-		// response anchor expired; retry without previous_response_id.", but omp only
-		// recognizes the standard `previous_response_not_found`, so the turn fails
-		// instead of transparently retrying with full context. Helps all codex-lb users.
+		// Auto-recover from codex-lb stale-anchor failures that omp doesn't classify.
+		// Two known shapes:
+		// 1. codex-lb's non-standard `codex_previous_response_stale` ("Upstream previous
+		//    response anchor expired; retry without previous_response_id.").
+		// 2. Upstream `invalid_request_error` "No tool call found for function call
+		//    output with call_id …" — codex-lb replays a turn upstream mid-stream and
+		//    keeps the downstream response id pinned to the pre-replay id, so omp's next
+		//    delta request anchors at an upstream response that lacks the tool calls.
+		// Both mean the anchor is unusable; omp's recovery (retry with full context, no
+		// previous_response_id) fixes both, but only fires on the standard
+		// `previous_response_not_found`. Helps all codex-lb users.
 		pkg: "@oh-my-pi/pi-ai",
 		file: "src/providers/openai-codex-responses.ts",
 		replacements: [
@@ -90,7 +96,12 @@ const PATCHES = [
 				label: "isCodexPreviousResponseNotFound: also match codex-lb stale anchor",
 				find: 'return error instanceof CodexProviderStreamError && error.code === "previous_response_not_found";',
 				replace:
+					'return error instanceof CodexProviderStreamError && (error.code === "previous_response_not_found" || error.code === "codex_previous_response_stale" || /previous_response_not_found|codex_previous_response_stale|previous response anchor expired|retry without previous_response_id|no tool call found for function call output/i.test(error.message));',
+				// Earlier versions of this replacement — rewritten back to `find` before
+				// applying, so upgrades don't fail with "cannot match source".
+				supersedes: [
 					'return error instanceof CodexProviderStreamError && (error.code === "previous_response_not_found" || error.code === "codex_previous_response_stale" || /previous_response_not_found|codex_previous_response_stale|previous response anchor expired|retry without previous_response_id/i.test(error.message));',
+				],
 			},
 		],
 	},
@@ -140,6 +151,11 @@ function main() {
 
 		let filePatched = false;
 		for (const r of patch.replacements) {
+			for (const superseded of r.supersedes ?? []) {
+				if (!content.includes(superseded)) continue;
+				content = content.replace(superseded, r.find);
+				if (!isCheck) filePatched = true;
+			}
 			const alreadyApplied = content.includes(r.replace);
 			const canApply = content.includes(r.find);
 			if (isCheck) {

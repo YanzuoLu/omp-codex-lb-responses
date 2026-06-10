@@ -1,6 +1,6 @@
 {
   "name": "omp-codex-lb-responses",
-  "version": "0.16.1",
+  "version": "0.16.2",
   "type": "module",
   "private": false,
   "description": "OMP plugin + patcher for Codex-compatible load-balanced backends.",
