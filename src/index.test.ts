@@ -59,6 +59,23 @@ providers:
 		expect(config.compat?.supportsReasoningEffort).toBe(false);
 	});
 
+	test("defaults models to freeform apply_patch, respecting an explicit override", () => {
+		const providers = registerWithModelsYml(`
+providers:
+  codex-lb:
+    baseUrl: https://lb.example/backend-api/codex
+    apiKey: sk-real-token
+    api: openai-codex-responses
+    models:
+      - id: gpt-5
+      - id: gpt-5-fn
+        applyPatchToolType: function
+`);
+		const models = providers["codex-lb"]?.models;
+		expect(models?.[0]?.applyPatchToolType).toBe("freeform");
+		expect(models?.[1]?.applyPatchToolType).toBe("function");
+	});
+
 	test("skips official ChatGPT Codex endpoint", () => {
 		const providers = registerWithModelsYml(`
 providers:
@@ -235,6 +252,13 @@ class MockWebSocket extends EventTarget {
 	fireMessage(data: string): void {
 		this.dispatchEvent(new MessageEvent("message", { data }));
 	}
+	fireClose(): void {
+		this.readyState = MockWebSocket.CLOSED;
+		this.dispatchEvent(new Event("close"));
+	}
+	fireError(message = "boom"): void {
+		this.dispatchEvent(Object.assign(new Event("error"), { message }));
+	}
 }
 
 describe("SSE→WebSocket upgrade", () => {
@@ -318,6 +342,104 @@ describe("SSE→WebSocket upgrade", () => {
 			expect(chunk).toContain("event: response.output_text.delta");
 			expect(chunk).not.toContain("codex.keepalive");
 			ws.fireMessage(JSON.stringify({ type: "response.completed" }));
+		} finally {
+			globalThis.WebSocket = originalWebSocket;
+		}
+	});
+
+	async function readAll(res: Response): Promise<string> {
+		const reader = res.body!.getReader();
+		const decoder = new TextDecoder();
+		let out = "";
+		while (true) {
+			const { value, done } = await reader.read();
+			if (value) out += decoder.decode(value);
+			if (done) break;
+		}
+		return out;
+	}
+
+	test("emits a synthetic retryable error when the WS closes before a terminal event", async () => {
+		const FAKE = "header.payload.codexlb-noterm";
+		shimTokens().set(FAKE, "sk-clb-real-noterm");
+		const originalWebSocket = globalThis.WebSocket;
+		globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket;
+		MockWebSocket.instances = [];
+		try {
+			const lbFetch = createCodexLbFetch(undefined);
+			const responseP = lbFetch("https://lb.example/backend-api/codex/responses", {
+				method: "POST",
+				headers: { authorization: `Bearer ${FAKE}`, accept: "text/event-stream" },
+				body: JSON.stringify({ model: "gpt-5" }),
+			});
+			const ws = MockWebSocket.instances[0]!;
+			ws.fireOpen();
+			const res = await responseP;
+			// Some content streamed, then codex-lb idle-closes WITHOUT a terminal frame.
+			ws.fireMessage(JSON.stringify({ type: "response.output_text.delta", delta: "hi" }));
+			ws.fireClose();
+			const text = await readAll(res);
+			expect(text).toContain("event: response.output_text.delta");
+			// The bridge must NOT end cleanly — it injects a retryable error frame so
+			// omp recovers instead of throwing "stream ended before terminal completion".
+			expect(text).toContain("event: error");
+			const errLine = text.split("\n").find(l => l.startsWith("data:") && l.includes("server_error"))!;
+			const payload = JSON.parse(errLine.slice("data:".length).trim());
+			expect(payload.type).toBe("error");
+			expect(payload.code).toBe("server_error");
+			expect(payload.message).toContain("closed before terminal");
+		} finally {
+			globalThis.WebSocket = originalWebSocket;
+		}
+	});
+
+	test("closes cleanly (no synthetic error) when a terminal event was seen", async () => {
+		const FAKE = "header.payload.codexlb-term";
+		shimTokens().set(FAKE, "sk-clb-real-term");
+		const originalWebSocket = globalThis.WebSocket;
+		globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket;
+		MockWebSocket.instances = [];
+		try {
+			const lbFetch = createCodexLbFetch(undefined);
+			const responseP = lbFetch("https://lb.example/backend-api/codex/responses", {
+				method: "POST",
+				headers: { authorization: `Bearer ${FAKE}`, accept: "text/event-stream" },
+				body: JSON.stringify({ model: "gpt-5" }),
+			});
+			const ws = MockWebSocket.instances[0]!;
+			ws.fireOpen();
+			const res = await responseP;
+			ws.fireMessage(JSON.stringify({ type: "response.completed" }));
+			// A late socket close after the terminal must not inject a spurious error.
+			ws.fireClose();
+			const text = await readAll(res);
+			expect(text).toContain("event: response.completed");
+			expect(text).not.toContain("server_error");
+		} finally {
+			globalThis.WebSocket = originalWebSocket;
+		}
+	});
+
+	test("surfaces a mid-stream WS error as a retryable error frame", async () => {
+		const FAKE = "header.payload.codexlb-err";
+		shimTokens().set(FAKE, "sk-clb-real-err");
+		const originalWebSocket = globalThis.WebSocket;
+		globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket;
+		MockWebSocket.instances = [];
+		try {
+			const lbFetch = createCodexLbFetch(undefined);
+			const responseP = lbFetch("https://lb.example/backend-api/codex/responses", {
+				method: "POST",
+				headers: { authorization: `Bearer ${FAKE}`, accept: "text/event-stream" },
+				body: JSON.stringify({ model: "gpt-5" }),
+			});
+			const ws = MockWebSocket.instances[0]!;
+			ws.fireOpen();
+			const res = await responseP;
+			ws.fireError("socket reset");
+			const text = await readAll(res);
+			expect(text).toContain("event: error");
+			expect(text).toContain("server_error");
 		} finally {
 			globalThis.WebSocket = originalWebSocket;
 		}

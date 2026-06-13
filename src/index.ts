@@ -210,6 +210,12 @@ function normalizeModel(model: RawModel): Record<string, unknown> | undefined {
 		api: CODEX_LB_API,
 		reasoning: typeof model.reasoning === "boolean" ? model.reasoning : true,
 		input: input.length > 0 ? input : ["text"],
+		// codex-lb proxies first-party GPT-5/Codex models, which support the freeform
+		// `apply_patch` custom tool. omp gates that on the per-model catalog field
+		// `applyPatchToolType` (the old provider-name source patch is gone as of 15.x),
+		// and codex-lb models aren't in the bundled catalog — so default to "freeform"
+		// here. A user can opt back to the function shape with `applyPatchToolType: function`.
+		applyPatchToolType: model.applyPatchToolType === "function" ? "function" : "freeform",
 		contextWindow: asPositiveNumber(model.contextWindow, DEFAULT_CONTEXT_WINDOW),
 		maxTokens: asPositiveNumber(model.maxTokens, DEFAULT_MAX_TOKENS),
 		cost: {
@@ -397,6 +403,7 @@ function fetchViaWebSocket(url: string, init: RequestInit): Promise<Response> {
 		let settled = false;
 		let streamClosed = false;
 		let sawFirstEvent = false;
+		let sawTerminal = false;
 		let lastProgressAt = 0;
 		let connectTimer: ReturnType<typeof setTimeout> | undefined;
 		let eventTimer: ReturnType<typeof setTimeout> | undefined;
@@ -423,6 +430,27 @@ function fetchViaWebSocket(url: string, init: RequestInit): Promise<Response> {
 			}
 		};
 
+		// End the proxied SSE stream with a synthetic, RETRYABLE error frame when the
+		// upstream WebSocket dies before a terminal event (codex-lb idle-closes with
+		// code 1001 and no terminal frame, and silently swallows failed terminal
+		// sends). A clean `controller.close()` here would make omp's SSE reader see a
+		// graceful EOF and throw the UNRECOVERABLE "Codex stream ended before terminal
+		// completion event". Instead we mirror omp's native-WS transport, which raises
+		// a retryable error on a close-before-completion: emitting an `error` frame
+		// whose `code` is in omp's retryable set lets omp's SSE recovery replay the
+		// turn (bounded by CODEX_MAX_RETRIES, and only while no content has streamed —
+		// tool-call blocks count as content, so a finished turn is never re-run). The
+		// honest cause rides in `message` so it stays visible in logs; `code` is only
+		// the classifier key.
+		const failRetryable = (message: string) => {
+			if (streamClosed) return;
+			if (controllerRef) {
+				const frame = `event: error\ndata: ${JSON.stringify({ type: "error", code: "server_error", message })}\n\n`;
+				try { controllerRef.enqueue(new TextEncoder().encode(frame)); } catch {}
+			}
+			closeStream();
+		};
+
 		// Two-phase liveness, mirroring omp's native WS transport: wait up to
 		// WS_PROXY_FIRST_EVENT_TIMEOUT_MS for the first frame, then enforce an idle
 		// ceiling measured from the last *progress* frame. codex.keepalive frames
@@ -434,7 +462,7 @@ function fetchViaWebSocket(url: string, init: RequestInit): Promise<Response> {
 				? Math.max(0, WS_PROXY_IDLE_TIMEOUT_MS - (Date.now() - lastProgressAt))
 				: WS_PROXY_FIRST_EVENT_TIMEOUT_MS;
 			eventTimer = setTimeout(() => {
-				closeStream(new Error(sawFirstEvent ? "WebSocket proxy idle timeout" : "WebSocket proxy first-event timeout"));
+				failRetryable(sawFirstEvent ? "WebSocket proxy idle timeout" : "WebSocket proxy first-event timeout");
 			}, ms);
 		};
 
@@ -499,12 +527,19 @@ function fetchViaWebSocket(url: string, init: RequestInit): Promise<Response> {
 						const sseChunk = `event: ${eventType}\ndata: ${text}\n\n`;
 						try { controller.enqueue(encoder.encode(sseChunk)); } catch { return; }
 						if (WS_PROXY_TERMINAL_EVENTS.has(eventType)) {
+							sawTerminal = true;
 							closeStream();
 						}
 					});
-					ws.addEventListener("close", () => { closeStream(); });
+					// A close without a forwarded terminal event is a premature death, not a
+					// graceful end — surface it as retryable so omp recovers instead of
+					// throwing "stream ended before terminal completion event".
+					ws.addEventListener("close", () => {
+						if (sawTerminal) closeStream();
+						else failRetryable("codex-lb websocket closed before terminal completion event");
+					});
 					ws.addEventListener("error", (e: Event) => {
-						closeStream(new Error(`WebSocket error: ${(e as ErrorEvent).message ?? "unknown"}`));
+						failRetryable(`WebSocket error: ${(e as ErrorEvent).message ?? "unknown"}`);
 					});
 				},
 				cancel() { closeStream(); },
@@ -710,7 +745,11 @@ function streamCodexLb(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
-	const apiKey = options?.apiKey;
+	// omp 15.10+ widened SimpleStreamOptions.apiKey to `string | ApiKeyResolver`,
+	// but streamSimple() resolves a resolver to a string one level up before it ever
+	// reaches a custom-api provider (see pi-ai stream.ts), so by here it's always a
+	// string. Narrow defensively rather than feed a function to the token Map.
+	const apiKey = typeof options?.apiKey === "string" ? options.apiKey : undefined;
 	const realApiKey = apiKey ? resolveRealApiKey(apiKey) : undefined;
 	if (!realApiKey || realApiKey === "N/A") {
 		throw new Error(`No API key for provider: ${model.provider}`);

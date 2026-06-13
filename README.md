@@ -7,7 +7,9 @@ This repo ships **two components** that work together:
 | Component | What | Why |
 |-----------|------|-----|
 | **Plugin** (`src/index.ts`) | Auth shim + SSE→WebSocket upgrade | codex-lb uses plain API keys (not JWTs) and needs all requests on WebSocket for session consistency |
-| **Patcher** (`bin/patch.mjs`) | Patches 2 hardcoded checks in omp | Enables remote compaction and freeform `apply_patch` tool — both gated by provider-name checks that plugins can't override |
+| **Patcher** (`bin/patch.mjs`) | Patches a couple of hardcoded provider-name checks in omp | Enables remote compaction and codex-lb stale-anchor recovery — gated by provider-name checks that plugins can't override |
+
+Requires **omp ≥ 15.12.3**.
 
 ## Install
 
@@ -121,16 +123,17 @@ The upgrade path bounds itself with a 10s connect timeout, a 60s first-event tim
 
 ## What the patcher does
 
-Two checks in omp are hardcoded to `model.provider === "openai-codex"` and cannot be overridden by plugins (ESM named imports are read-only):
+Some checks in omp are hardcoded to `model.provider === "openai-codex"` and cannot be overridden by plugins (ESM named imports are read-only):
 
 | Patch | File | Change |
 |-------|------|--------|
 | Remote compaction | `pi-agent-core/.../compaction/openai.ts` | Also accept `model.api === "openai-codex-responses"` |
-| Freeform apply-patch | `pi-ai/.../model-thinking.ts` | Gate on `model.api` alone, not `model.provider` |
 | Web search → codex-lb *(optional)* | `pi-coding-agent/.../web/search/providers/codex.ts` | Route omp's `codex` search provider to codex-lb when a provider sets `webSearch: tool`. No-op (falls back to official OAuth) when unset. |
-| Stale `previous_response_id` recovery | `pi-ai/.../openai-codex-responses.ts` | Treat codex-lb's `codex_previous_response_stale` ("anchor expired") and upstream's "No tool call found for function call output with call_id …" (codex-lb replayed a turn upstream and the pinned downstream response id no longer matches the response holding the tool calls) as retry-without-`previous_response_id` signals, so omp transparently retries with full context instead of failing the turn |
+| Stale `previous_response_id` recovery | `pi-ai/.../openai-codex-responses.ts` | Broaden `isCodexStalePreviousResponseError` to also treat codex-lb's `codex_previous_response_stale` ("anchor expired") and upstream's "No tool call found for function call output with call_id …" (codex-lb replayed a turn upstream and the pinned downstream response id no longer matches the response holding the tool calls) as retry-without-`previous_response_id` signals. Without it omp short-circuits codex-lb's `response.failed` to "not stale" and fails the turn instead of retrying with full context. |
 
-Without the first two patches, long conversations fall back to local summarization (losing encrypted reasoning state) and the apply-patch tool uses standard JSON schema instead of the optimized grammar format. The third is only needed for `webSearch: tool` (native search card).
+Without the remote-compaction patch, long conversations fall back to local summarization (losing encrypted reasoning state). The web-search patch is only needed for `webSearch: tool` (native search card).
+
+**Freeform `apply_patch`** no longer needs a patch: as of omp 15.x the freeform-vs-function decision is the per-model catalog field `applyPatchToolType`, so the plugin just sets `applyPatchToolType: "freeform"` on its models (override with `applyPatchToolType: function` per model in `models.yml`).
 
 ## Patcher commands
 

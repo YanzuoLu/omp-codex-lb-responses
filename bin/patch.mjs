@@ -26,17 +26,12 @@ const PATCHES = [
 			},
 		],
 	},
-	{
-		pkg: "@oh-my-pi/pi-ai",
-		file: "src/model-thinking.ts",
-		replacements: [
-			{
-				label: "applyPatchToolType: gate on api type alone",
-				find: `if (model.provider === "openai-codex" && model.api === "openai-codex-responses") {`,
-				replace: `if (model.api === "openai-codex-responses") {`,
-			},
-		],
-	},
+	// NOTE: the old `applyPatchToolType` gate in pi-ai/src/model-thinking.ts is
+	// gone as of omp 15.x — `model-thinking` moved to @oh-my-pi/pi-catalog and the
+	// freeform-vs-function apply_patch decision is now the per-model catalog field
+	// `model.applyPatchToolType === "freeform"` (read in openai-codex-responses.ts
+	// / openai-responses.ts). The plugin now sets that field on its normalized
+	// models instead, so no source patch is needed for freeform apply_patch.
 	{
 		// Optional — only needed for `webSearch: tool` (native search-card UI).
 		// Redirects omp's built-in `codex` web-search provider to codex-lb when the
@@ -93,15 +88,19 @@ const PATCHES = [
 		file: "src/providers/openai-codex-responses.ts",
 		replacements: [
 			{
-				label: "isCodexPreviousResponseNotFound: also match codex-lb stale anchor",
-				find: 'return error instanceof CodexProviderStreamError && error.code === "previous_response_not_found";',
+				// As of omp 15.12.x the matcher is `isCodexStalePreviousResponseError`
+				// and its first line early-returns for ANY CodexProviderStreamError with
+				// `code === "previous_response_not_found"` — short-circuiting BEFORE the
+				// message regex below it. codex-lb surfaces its stale anchor as a
+				// `response.failed` → CodexProviderStreamError with code
+				// `codex_previous_response_stale`, so stock omp returns false here and the
+				// stale-anchor recovery never fires. Broaden the early return to also match
+				// codex-lb's code and the two message shapes (stale anchor + replayed
+				// "no tool call found for function call output").
+				label: "isCodexStalePreviousResponseError: also match codex-lb stale anchor",
+				find: 'if (error instanceof CodexProviderStreamError) return error.code === "previous_response_not_found";',
 				replace:
-					'return error instanceof CodexProviderStreamError && (error.code === "previous_response_not_found" || error.code === "codex_previous_response_stale" || /previous_response_not_found|codex_previous_response_stale|previous response anchor expired|retry without previous_response_id|no tool call found for function call output/i.test(error.message));',
-				// Earlier versions of this replacement — rewritten back to `find` before
-				// applying, so upgrades don't fail with "cannot match source".
-				supersedes: [
-					'return error instanceof CodexProviderStreamError && (error.code === "previous_response_not_found" || error.code === "codex_previous_response_stale" || /previous_response_not_found|codex_previous_response_stale|previous response anchor expired|retry without previous_response_id/i.test(error.message));',
-				],
+					'if (error instanceof CodexProviderStreamError) return error.code === "previous_response_not_found" || error.code === "codex_previous_response_stale" || /previous_response_not_found|codex_previous_response_stale|previous response anchor expired|retry without previous_response_id|no tool call found for function call output/i.test(error.message);',
 			},
 		],
 	},
