@@ -102,6 +102,36 @@ const PATCHES = [
 				replace:
 					'if (error instanceof CodexProviderStreamError) return error.code === "previous_response_not_found" || error.code === "codex_previous_response_stale" || /previous_response_not_found|codex_previous_response_stale|previous response anchor expired|retry without previous_response_id|no tool call found for function call output/i.test(error.message);',
 			},
+			{
+				// Auto-retry codex-lb TRANSIENT upstream failures. codex-lb load-balances
+				// across upstream ChatGPT accounts and surfaces a `response.failed` with an
+				// `error.code` once its own per-request account failover (up to ~3 accounts)
+				// is exhausted. omp only classifies {model_error, server_error,
+				// internal_error} as retryable, so a transient upstream blip (e.g.
+				// `upstream_unavailable` / "Request to upstream timed out") fails the whole
+				// turn on the FIRST attempt instead of retrying — surprising on session
+				// turn 1. `upstream_error` and `upstream_request_timeout` are unconditionally
+				// transient in codex-lb (helpers.py classify_upstream_failure / _TRANSIENT_*),
+				// so add them as retryable codes. A fresh omp retry starts a new account
+				// selection round, bounded by CODEX_MAX_RETRIES and gated on no content yet.
+				label: "CODEX_RETRYABLE_EVENT_CODES: also retry codex-lb transient upstream codes",
+				find: 'const CODEX_RETRYABLE_EVENT_CODES = new Set(["model_error", "server_error", "internal_error"]);',
+				replace:
+					'const CODEX_RETRYABLE_EVENT_CODES = new Set(["model_error", "server_error", "internal_error", "upstream_error", "upstream_request_timeout"]);',
+			},
+			{
+				// Match codex-lb's transient *messages* too (covers `upstream_unavailable`
+				// and `stream_incomplete`, both of which are retryable ONLY when the message
+				// is a transient-network phrase). Matching by message — not bare code —
+				// deliberately EXCLUDES the non-retryable lookalikes: TLS-cert failures
+				// ("certificate verify failed"), the suppressed-duplicate-tool-call
+				// `stream_incomplete`, and `client_disconnected` (none contain these
+				// phrases), so auth/400/permission/duplicate errors still surface.
+				label: "CODEX_RETRYABLE_EVENT_MESSAGE: also retry codex-lb transient upstream messages",
+				find: '/processing your request|retry your request|temporar(?:y|ily)|overloaded|service.?unavailable|internal error|server error/i;',
+				replace:
+					'/processing your request|retry your request|temporar(?:y|ily)|overloaded|service.?unavailable|internal error|server error|timed out|connection reset|connection closed|connection aborted|broken pipe|server disconnected|cannot connect|keepalive ping timeout|upstream closed|websocket closed before response/i;',
+			},
 		],
 	},
 ];
