@@ -5,35 +5,38 @@ import { activate, defaultModels, makeStreamSimple, readConfig, type CodexLbConf
 const BASE = "https://lb.test/v1";
 
 describe("readConfig", () => {
-	test("returns undefined unless BOTH api key and base url are set", () => {
-		expect(readConfig({})).toBeUndefined();
-		expect(readConfig({ CODEX_LB_API_KEY: "   " })).toBeUndefined();
-		expect(readConfig({ CODEX_LB_API_KEY: "k" })).toBeUndefined(); // no base url → no default
-		expect(readConfig({ CODEX_LB_BASE_URL: BASE })).toBeUndefined(); // no api key
+	test("returns undefined unless BOTH api key and base url are resolved", () => {
+		expect(readConfig({}, {})).toBeUndefined();
+		expect(readConfig({}, { CODEX_LB_API_KEY: "   " })).toBeUndefined();
+		expect(readConfig({}, { CODEX_LB_API_KEY: "k" })).toBeUndefined(); // no base url → no default
+		expect(readConfig({}, { CODEX_LB_BASE_URL: BASE })).toBeUndefined(); // no api key
+		expect(readConfig({ apiKey: "k" }, {})).toBeUndefined(); // settings: no base url
 	});
 
-	test("defaults providerID / models given an api key and base url", () => {
-		const c = readConfig({ CODEX_LB_API_KEY: "sk-clb-x", CODEX_LB_BASE_URL: BASE })!;
+	test("reads from plugin settings (omp plugin config --set)", () => {
+		const c = readConfig({ apiKey: "sk-clb-x", baseUrl: BASE, providerId: "clb", models: "a, b ,", webSearch: "inject" })!;
 		expect(c.apiKey).toBe("sk-clb-x");
 		expect(c.baseUrl).toBe(BASE);
-		expect(c.providerID).toBe("codex-lb");
-		expect(c.models.map((m) => m.id)).toContain("gpt-5.5");
-		expect(c.models.every((m) => m.api === "codex-lb-responses")).toBe(true);
-		expect(c.injectWebSearch).toBe(false);
-	});
-
-	test("honors env overrides and strips a trailing slash from baseUrl", () => {
-		const c = readConfig({
-			CODEX_LB_API_KEY: "k",
-			CODEX_LB_BASE_URL: "https://host/v1/",
-			CODEX_LB_PROVIDER_ID: "clb",
-			CODEX_LB_MODELS: "a, b ,",
-			CODEX_LB_WEB_SEARCH: "inject",
-		})!;
-		expect(c.baseUrl).toBe("https://host/v1");
 		expect(c.providerID).toBe("clb");
 		expect(c.models.map((m) => m.id)).toEqual(["a", "b"]);
 		expect(c.injectWebSearch).toBe(true);
+	});
+
+	test("plugin settings take precedence over env, with env as fallback", () => {
+		const c = readConfig(
+			{ baseUrl: BASE }, // base url from settings
+			{ CODEX_LB_API_KEY: "env-key", CODEX_LB_BASE_URL: "https://ignored/v1" }, // api key from env
+		)!;
+		expect(c.baseUrl).toBe(BASE); // settings win
+		expect(c.apiKey).toBe("env-key"); // env fallback
+	});
+
+	test("defaults providerID / models, and strips a trailing slash from baseUrl", () => {
+		const c = readConfig({}, { CODEX_LB_API_KEY: "k", CODEX_LB_BASE_URL: "https://host/v1/", CODEX_LB_MODELS: "a, b ," })!;
+		expect(c.baseUrl).toBe("https://host/v1");
+		expect(c.providerID).toBe("codex-lb");
+		expect(c.models.map((m) => m.id)).toEqual(["a", "b"]);
+		expect(c.injectWebSearch).toBe(false);
 	});
 
 	test("default models are reasoning models with sane limits", () => {
@@ -72,6 +75,17 @@ describe("activate", () => {
 		pool?.close();
 	});
 
+	test("activates from plugin settings (no env)", () => {
+		const providers: Record<string, any> = {};
+		const pool = activate(
+			{ registerProvider: (n, c) => (providers[n] = c) },
+			{ settings: { apiKey: "k", baseUrl: BASE }, env: {}, WebSocketImpl: class {} },
+		);
+		expect(providers["codex-lb"]).toBeDefined();
+		expect(providers["codex-lb"].baseUrl).toBe(BASE);
+		pool?.close();
+	});
+
 	test("honors a custom provider id", () => {
 		const providers: Record<string, any> = {};
 		const pool = activate(
@@ -85,7 +99,7 @@ describe("activate", () => {
 });
 
 describe("makeStreamSimple", () => {
-	const config: CodexLbConfig = readConfig({ CODEX_LB_API_KEY: "real-key", CODEX_LB_BASE_URL: BASE })!;
+	const config: CodexLbConfig = readConfig({ apiKey: "real-key", baseUrl: BASE })!;
 
 	test("delegates to the inner openai-responses stream with a bound WS fetch and re-tags events", async () => {
 		const boundFetch = async () => new Response(null);

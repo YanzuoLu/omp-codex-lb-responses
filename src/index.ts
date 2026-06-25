@@ -84,22 +84,60 @@ export function defaultModels(): ModelEntry[] {
 	];
 }
 
+type Settings = Record<string, unknown>;
+
+function pickString(settings: Settings, settingKey: string, env: Record<string, string | undefined>, envKey: string): string | undefined {
+	const fromSettings = settings[settingKey];
+	if (typeof fromSettings === "string" && fromSettings.trim()) return fromSettings.trim();
+	const fromEnv = env[envKey]?.trim();
+	return fromEnv || undefined;
+}
+
+function pickModelIds(settings: Settings, env: Record<string, string | undefined>): string[] | undefined {
+	const raw = settings.models ?? env.CODEX_LB_MODELS;
+	const list = typeof raw === "string" ? raw.split(",") : Array.isArray(raw) ? raw : undefined;
+	if (!list) return undefined;
+	const ids = list.map((s) => String(s).trim()).filter(Boolean);
+	return ids.length > 0 ? ids : undefined;
+}
+
 /**
- * Reads codex-lb config from the environment. Returns undefined unless BOTH
- * `CODEX_LB_API_KEY` and `CODEX_LB_BASE_URL` are set — the base URL has no
- * built-in default, so a codex-lb host is never baked into this package.
+ * Resolves codex-lb config from this plugin's persistent settings
+ * (`omp plugin config omp-codex-lb-responses --set key=value`), falling back to
+ * environment variables. Returns undefined unless BOTH a base URL and an API key
+ * are resolved — there is no built-in default endpoint, so a codex-lb host is
+ * never baked into this package.
+ *
+ * Keys: `baseUrl`/`CODEX_LB_BASE_URL`, `apiKey`/`CODEX_LB_API_KEY`,
+ * `providerId`/`CODEX_LB_PROVIDER_ID`, `models`/`CODEX_LB_MODELS`,
+ * `webSearch`/`CODEX_LB_WEB_SEARCH`.
  */
-export function readConfig(env: Record<string, string | undefined> = process.env): CodexLbConfig | undefined {
-	const apiKey = env.CODEX_LB_API_KEY?.trim();
-	const baseUrlRaw = env.CODEX_LB_BASE_URL?.trim();
+export function readConfig(settings: Settings = {}, env: Record<string, string | undefined> = process.env): CodexLbConfig | undefined {
+	const apiKey = pickString(settings, "apiKey", env, "CODEX_LB_API_KEY");
+	const baseUrlRaw = pickString(settings, "baseUrl", env, "CODEX_LB_BASE_URL");
 	if (!apiKey || !baseUrlRaw) return undefined;
 	const baseUrl = baseUrlRaw.replace(/\/+$/, "");
-	const providerID = env.CODEX_LB_PROVIDER_ID?.trim() || DEFAULT_PROVIDER_ID;
-	const webSearch = env.CODEX_LB_WEB_SEARCH?.trim().toLowerCase();
+	const providerID = pickString(settings, "providerId", env, "CODEX_LB_PROVIDER_ID") ?? DEFAULT_PROVIDER_ID;
+	const webSearch = (pickString(settings, "webSearch", env, "CODEX_LB_WEB_SEARCH") ?? "").toLowerCase();
 	const injectWebSearch = webSearch === "inject" || webSearch === "true";
-	const ids = env.CODEX_LB_MODELS?.split(",").map((s) => s.trim()).filter(Boolean);
-	const models = ids && ids.length > 0 ? ids.map((id) => modelEntry(id)) : defaultModels();
+	const ids = pickModelIds(settings, env);
+	const models = ids ? ids.map((id) => modelEntry(id)) : defaultModels();
 	return { providerID, baseUrl, apiKey, models, injectWebSearch };
+}
+
+/**
+ * Loads this plugin's persistent settings from omp (the `omp plugin config`
+ * store). Best-effort: returns {} if omp's plugin loader isn't reachable, in
+ * which case config falls back entirely to environment variables.
+ */
+export async function loadPluginSettings(pluginName = SERVICE): Promise<Settings> {
+	try {
+		const mod = (await import("@oh-my-pi/pi-coding-agent/extensibility/plugins/loader")) as {
+			getPluginSettings?: (name: string, cwd: string) => Promise<Settings>;
+		};
+		if (typeof mod.getPluginSettings === "function") return await mod.getPluginSettings(pluginName, process.cwd());
+	} catch {}
+	return {};
 }
 
 type InnerStream = (model: Model, context: Context, options?: Record<string, unknown>) => AssistantMessageEventStream;
@@ -175,6 +213,7 @@ export function makeStreamSimple(
 }
 
 export interface ActivateDeps {
+	settings?: Settings;
 	env?: Record<string, string | undefined>;
 	innerStream?: InnerStream;
 	AssistantMessageEventStream?: EventStreamCtor;
@@ -184,9 +223,11 @@ export interface ActivateDeps {
 
 export function activate(pi: ExtensionApi, deps: ActivateDeps = {}): WebSocketFetch | undefined {
 	pi.setLabel?.("Codex LB Responses");
-	const config = readConfig(deps.env);
+	const config = readConfig(deps.settings ?? {}, deps.env);
 	if (!config) {
-		pi.logger?.warn?.(`${SERVICE}: set CODEX_LB_API_KEY and CODEX_LB_BASE_URL (your codex-lb /v1 endpoint) to enable the codex-lb provider`);
+		pi.logger?.warn?.(
+			`${SERVICE}: not configured. Set a base URL and API key via \`omp plugin config ${SERVICE} --set baseUrl=<your codex-lb /v1 endpoint> --set apiKey=<sk-clb-…>\` (or the CODEX_LB_BASE_URL / CODEX_LB_API_KEY env vars).`,
+		);
 		return undefined;
 	}
 	const createPool = deps.createPool ?? createWebSocketFetch;
@@ -214,6 +255,7 @@ export function activate(pi: ExtensionApi, deps: ActivateDeps = {}): WebSocketFe
 	return pool;
 }
 
-export default function codexLbResponses(pi: ExtensionApi): void {
-	activate(pi);
+export default async function codexLbResponses(pi: ExtensionApi): Promise<void> {
+	const settings = await loadPluginSettings();
+	activate(pi, { settings });
 }

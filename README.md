@@ -34,28 +34,35 @@ provider-scoped `fetch`. Nothing global is patched.
 ## Install
 
 ```bash
-omp plugin install github:YanzuoLu/omp-codex-lb-responses#v0.18.0
+omp plugin install github:YanzuoLu/omp-codex-lb-responses#v0.18.1
 ```
 
-Pin a **version tag** (`#v0.18.0`), not a commit SHA, so upgrades are a one-line
+Pin a **version tag** (`#v0.18.1`), not a commit SHA, so upgrades are a one-line
 bump. There is **no patcher step** and nothing to re-apply after `omp update`.
 
 ## Configure
 
-All configuration is environment variables — no `models.yml`, no `config.yml`
-entry:
+Configure with `omp plugin config` (stored per-plugin in
+`~/.omp/plugins/omp-plugins.lock.json`) — no `models.yml`, no `config.yml`:
 
-| Variable | Required | Default | Meaning |
-|----------|----------|---------|---------|
-| `CODEX_LB_API_KEY` | **yes** | — | Your codex-lb key (`sk-clb-…`), sent as a plain `Authorization: Bearer`. |
-| `CODEX_LB_BASE_URL` | **yes** | — | Your codex-lb `/v1` endpoint. The plugin opens `wss://…/responses` derived from it. |
-| `CODEX_LB_PROVIDER_ID` | no | `codex-lb` | Provider id shown in the picker (`<id>/<model>`). |
-| `CODEX_LB_MODELS` | no | built-in catalog | Comma-separated model ids to register instead of the defaults. |
-| `CODEX_LB_WEB_SEARCH` | no | off | `inject` to add the hosted `web_search` tool to each turn (plugin-only, no patch; no native search-card UI). |
+```bash
+omp plugin config set omp-codex-lb-responses baseUrl https://your-codex-lb-host/v1
+omp plugin config set omp-codex-lb-responses apiKey  sk-clb-…
+omp plugin config list omp-codex-lb-responses           # review (apiKey is masked)
+```
 
-Both `CODEX_LB_API_KEY` and `CODEX_LB_BASE_URL` are required — there is **no
-built-in default endpoint** baked into this package. The plugin no-ops if either
-is unset. For example, in your shell profile:
+| Setting | Required | Default | Env fallback | Meaning |
+|---------|----------|---------|--------------|---------|
+| `baseUrl` | **yes** | — | `CODEX_LB_BASE_URL` | Your codex-lb `/v1` endpoint. The plugin opens `wss://…/responses` derived from it. |
+| `apiKey` | **yes** | — | `CODEX_LB_API_KEY` | codex-lb key (`sk-clb-…`), sent as a plain `Authorization: Bearer` (stored masked). |
+| `providerId` | no | `codex-lb` | `CODEX_LB_PROVIDER_ID` | Provider id shown in the picker (`<id>/<model>`). |
+| `models` | no | built-in catalog | `CODEX_LB_MODELS` | Comma-separated model ids to register instead of the defaults. |
+| `webSearch` | no | off | `CODEX_LB_WEB_SEARCH` | `inject` to add the hosted `web_search` tool to each turn (plugin-only, no patch; no native search-card UI). |
+
+`baseUrl` and `apiKey` are required — there is **no built-in default endpoint**
+baked into this package, so a codex-lb host is never committed here. Each setting
+also reads from its env var as a fallback (plugin config wins), so you can keep
+secrets in the environment instead:
 
 ```bash
 export CODEX_LB_API_KEY="sk-clb-…"
@@ -110,9 +117,9 @@ Or pick `codex-lb/<model>` in the model picker. The default catalog is `gpt-5.5`
   omp, revert it: `bunx github:YanzuoLu/omp-codex-lb-responses#<old-tag> --revert`
   (or just reinstall omp). 0.18 needs no patches.
 - **Remove the `codex-lb` provider from `~/.omp/agent/models.yml`** — it is no
-  longer read. Configure via the environment variables above instead.
-- Reinstall the plugin at the new tag and set both `CODEX_LB_API_KEY` and
-  `CODEX_LB_BASE_URL` (your codex-lb `/v1` endpoint).
+  longer read. Configure with `omp plugin config` (or the env vars) instead.
+- Reinstall the plugin at the new tag and set `baseUrl` + `apiKey` via
+  `omp plugin config set omp-codex-lb-responses …` (see [Configure](#configure)).
 - **Lost vs 0.17:** omp's remote compaction (long conversations fall back to local
   summarization) and the native web-search **card** (use `CODEX_LB_WEB_SEARCH=inject`
   for hosted search without the card). Everything else — WebSocket transport,

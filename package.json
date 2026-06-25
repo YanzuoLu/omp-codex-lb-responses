@@ -1,6 +1,6 @@
 {
   "name": "omp-codex-lb-responses",
-  "version": "0.18.0",
+  "version": "0.18.1",
   "type": "module",
   "private": false,
   "description": "OMP plugin: a clean codex-lb provider that routes the OpenAI Responses API over codex-lb's WebSocket transport — no source patcher, no global monkeypatch, no synthetic JWT.",
@@ -11,8 +11,37 @@
   },
   "omp": {
     "name": "Codex LB Responses",
-    "description": "Registers a codex-lb provider that streams OpenAI Responses over codex-lb's WebSocket; configured via env (CODEX_LB_API_KEY / CODEX_LB_BASE_URL).",
-    "extensions": ["src/index.ts"]
+    "description": "Registers a codex-lb provider that streams OpenAI Responses over codex-lb's WebSocket. Configure with `omp plugin config set omp-codex-lb-responses baseUrl <your codex-lb /v1 endpoint>` and `… apiKey <sk-clb-…>` (or the CODEX_LB_* env vars).",
+    "extensions": ["src/index.ts"],
+    "settings": {
+      "baseUrl": {
+        "type": "string",
+        "description": "Your codex-lb /v1 endpoint. The plugin opens wss://…/responses derived from it.",
+        "env": "CODEX_LB_BASE_URL"
+      },
+      "apiKey": {
+        "type": "string",
+        "secret": true,
+        "description": "codex-lb API key (sk-clb-…), sent as a plain Authorization: Bearer.",
+        "env": "CODEX_LB_API_KEY"
+      },
+      "providerId": {
+        "type": "string",
+        "description": "Provider id shown in the model picker (<id>/<model>).",
+        "default": "codex-lb",
+        "env": "CODEX_LB_PROVIDER_ID"
+      },
+      "models": {
+        "type": "string",
+        "description": "Comma-separated model ids to register instead of the built-in catalog.",
+        "env": "CODEX_LB_MODELS"
+      },
+      "webSearch": {
+        "type": "string",
+        "description": "Set to 'inject' to add the hosted web_search tool to each turn (plugin-only; no native search-card UI).",
+        "env": "CODEX_LB_WEB_SEARCH"
+      }
+    }
   },
   "scripts": {
     "test": "bun test"
