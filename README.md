@@ -1,166 +1,137 @@
 # omp-codex-lb-responses
 
-Make [omp](https://github.com/can1357/oh-my-pi) work with Codex-compatible load balancers like [codex-lb](https://github.com/Soju06/codex-lb).
+An [omp](https://github.com/badlogic/pi-mono) (oh-my-pi) plugin that adds a
+**`codex-lb` provider** which routes the OpenAI **Responses API over codex-lb's
+WebSocket transport**. One WebSocket per conversation keeps codex-lb pinned to a
+single upstream account for the whole turn-sequence — the session/account
+consistency the load balancer needs — so long turns stop dropping silently.
 
-This repo ships **two components** that work together:
+You switch to it by selecting `codex-lb/<model>` (`--model codex-lb/gpt-5.5`, or
+the model picker). Your other providers are left untouched.
 
-| Component | What | Why |
-|-----------|------|-----|
-| **Plugin** (`src/index.ts`) | Auth shim + SSE→WebSocket upgrade | codex-lb uses plain API keys (not JWTs) and needs all requests on WebSocket for session consistency |
-| **Patcher** (`bin/patch.mjs`) | Patches a couple of hardcoded provider-name checks in omp | Enables remote compaction and codex-lb stale-anchor recovery — gated by provider-name checks that plugins can't override |
+> **0.18 is a rewrite.** Earlier versions (≤ 0.17) reused omp's built-in
+> **codex** transport, which forced a synthetic ChatGPT JWT, a global
+> `fetch`/`WebSocket` monkeypatch, a `models.yml` provider declaration, and a
+> source **patcher** that had to be re-applied after every `omp update`. This
+> version drops all four: it registers against omp's plain **`openai-responses`**
+> path (a bare `Authorization: Bearer` key), injects a **provider-scoped `fetch`**
+> for the WebSocket bridge, and is configured entirely from the **environment**.
+> See [Migrating from 0.17.x](#migrating-from-017x).
 
-Requires **omp ≥ 15.12.3**.
+Requires **omp ≥ 16.0**.
+
+## Why WebSocket
+
+codex-lb needs a WebSocket for session/account consistency: each socket is pinned
+to one upstream ChatGPT account, so a conversation that streams every turn down
+the *same* socket always lands on the same account. Over stateless HTTP the load
+balancer can route consecutive turns to different accounts, and a turn sometimes
+ends with no reply. This plugin reuses omp's built-in `openai-responses` code path
+(so reasoning / encrypted-content behave exactly like a native Responses model)
+and upgrades each streaming request to a `wss://…/responses` WebSocket via a
+provider-scoped `fetch`. Nothing global is patched.
 
 ## Install
 
 ```bash
-# 1. Install the plugin
-omp plugin install github:YanzuoLu/omp-codex-lb-responses
-
-# 2. Apply patches
-bunx github:YanzuoLu/omp-codex-lb-responses#main
+omp plugin install github:YanzuoLu/omp-codex-lb-responses#v0.18.0
 ```
+
+Pin a **version tag** (`#v0.18.0`), not a commit SHA, so upgrades are a one-line
+bump. There is **no patcher step** and nothing to re-apply after `omp update`.
 
 ## Configure
 
-### `~/.omp/agent/models.yml`
+All configuration is environment variables — no `models.yml`, no `config.yml`
+entry:
 
-```yaml
-providers:
-  codex-lb:
-    baseUrl: https://your-codex-lb-host/backend-api/codex
-    apiKey: sk-clb-your-token
-    api: openai-codex-responses
-    auth: apiKey
-    webSearch: tool          # optional — web search via codex-lb: "tool" (native card) or "inject" (no patch). See "Web search" below.
-    models:
-      - id: gpt-5.5
-        name: gpt-5.5
-        reasoning: true
-        input: [text, image]
-        contextWindow: 272000
-        maxTokens: 128000
-        cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 }
-```
+| Variable | Required | Default | Meaning |
+|----------|----------|---------|---------|
+| `CODEX_LB_API_KEY` | **yes** | — | Your codex-lb key (`sk-clb-…`), sent as a plain `Authorization: Bearer`. |
+| `CODEX_LB_BASE_URL` | **yes** | — | Your codex-lb `/v1` endpoint. The plugin opens `wss://…/responses` derived from it. |
+| `CODEX_LB_PROVIDER_ID` | no | `codex-lb` | Provider id shown in the picker (`<id>/<model>`). |
+| `CODEX_LB_MODELS` | no | built-in catalog | Comma-separated model ids to register instead of the defaults. |
+| `CODEX_LB_WEB_SEARCH` | no | off | `inject` to add the hosted `web_search` tool to each turn (plugin-only, no patch; no native search-card UI). |
 
-### `~/.omp/agent/config.yml`
-
-Optional. The plugin already forces WebSocket for codex-lb providers, so this is
-**not required** for codex-lb — it only affects omp's built-in `openai-codex`
-provider. Harmless to set:
-
-```yaml
-providers:
-  openaiWebsockets: "on"
-```
-
-## Web search (optional)
-
-Give the model web search through your codex-lb account — no separate search API
-key, no `/login openai-codex` OAuth. Pick **one** mode per provider in `models.yml`
-via the `webSearch` flag. (Your codex-lb account/plan must actually have web
-search — the same one the Codex CLI uses.)
-
-### `webSearch: tool` — native search card (recommended)
-
-The model uses omp's own `web_search` tool, but the request is routed to codex-lb
-instead of the official ChatGPT endpoint, so you get omp's full **"Search" card +
-clickable sources**, identical to the built-in Codex search.
-
-Requires the optional patch (`bin/patch.mjs` redirects omp's `codex` search
-provider — see [What the patcher does](#what-the-patcher-does)) plus:
-
-```yaml
-# ~/.omp/agent/config.yml
-providers:
-  webSearch: codex        # select omp's codex search provider (now → codex-lb)
-```
+Both `CODEX_LB_API_KEY` and `CODEX_LB_BASE_URL` are required — there is **no
+built-in default endpoint** baked into this package. The plugin no-ops if either
+is unset. For example, in your shell profile:
 
 ```bash
-# pin the search to a model your codex-lb supports (omp's defaults may be rejected)
-export PI_CODEX_WEB_SEARCH_MODEL=gpt-5.5
+export CODEX_LB_API_KEY="sk-clb-…"
+export CODEX_LB_BASE_URL="https://your-codex-lb-host/v1"
 ```
 
-By default the search request mirrors what the Codex CLI sends: `search_context_size: medium`, the same `web_search` tool spec, **reasoning matched to your main model**, and a **180s** hard timeout. (codex-lb generates slowly — the lookup is fast but the model's summary can take ~100s; omp's old 60s default aborted it. Codex itself is just as slow but doesn't abort, because its web search runs inside the main turn with no 60s tool cap.) Tune per provider:
-
-```yaml
-# ~/.omp/agent/models.yml  (under the provider)
-webSearch: tool
-webSearchOptions:            # all optional
-  contextSize: medium        # low | medium | high  (default: medium)
-  reasoningEffort: auto      # auto = match the main model each turn; or none|minimal|low|medium|high|xhigh
-  timeoutSeconds: 180        # search hard timeout (default: 180)
-  userLocationCountry: US    # user_location.country (default: US; "none" to omit)
-  tool:                      # optional: full web_search tool object — overrides everything above
-    type: web_search
-    return_token_budget: default
-    search_context_size: medium
-    user_location: { type: approximate, country: US }
-```
-
-### `webSearch: inject` — no patch, no UI
-
-Plugin-only. The plugin injects the hosted `web_search` tool into the model's
-`response.create` frame (Codex-CLI-style); the search runs server-side and the
-answer is web-informed with inline source URLs, but there's **no search card /
-structured citations** (omp ignores the `web_search_call` events — it keeps the
-item in history so multi-turn stays consistent). No patch needed.
-
-> Don't set both modes on one provider. `webSearch: true` is an alias for `inject`.
-
-## What the plugin does
-
-- **Forces WebSocket everywhere.** omp's native Codex WebSocket transport is the primary path (the plugin sets `preferWebsockets`). If omp ever falls back to SSE, the plugin upgrades that SSE request to WebSocket too — codex-lb needs WebSocket for session/account consistency.
-- Intercepts `globalThis.WebSocket` — rewrites auth headers on every WebSocket connection.
-- Intercepts `globalThis.fetch` / the per-request fetch — performs the SSE→WebSocket upgrade (detected on the synthetic token *before* it is swapped for the real key) and rewrites auth headers.
-- Creates a synthetic JWT so omp's built-in Codex provider can initialize, then swaps it for the real API key before network I/O.
-- Strips `chatgpt-account-id` header (codex-lb manages its own accounts).
-- **Auto-recovers.** omp permanently disables WebSocket for a session after one fatal failure (e.g. a slow handshake under load); the plugin re-enables it after a short cooldown so a single hiccup doesn't pin the whole session to the slower path.
-
-### Tuning the upgraded WebSocket (optional)
-
-The upgrade path bounds itself with a 10s connect timeout, a 60s first-event timeout, and a 300s idle timeout (idle measured from the last real event — `codex.keepalive` frames no longer reset it). These are constants in `src/index.ts`; omp's own native-transport timeouts are tunable via `PI_CODEX_WEBSOCKET_*` env vars (see omp docs).
-
-## What the patcher does
-
-Some checks in omp are hardcoded to `model.provider === "openai-codex"` and cannot be overridden by plugins (ESM named imports are read-only):
-
-| Patch | File | Change |
-|-------|------|--------|
-| Remote compaction | `pi-agent-core/.../compaction/openai.ts` | Also accept `model.api === "openai-codex-responses"` |
-| Web search → codex-lb *(optional)* | `pi-coding-agent/.../web/search/providers/codex.ts` | Route omp's `codex` search provider to codex-lb when a provider sets `webSearch: tool`. No-op (falls back to official OAuth) when unset. |
-| Stale `previous_response_id` recovery | `pi-ai/.../openai-codex-responses.ts` | Broaden `isCodexStalePreviousResponseError` to also treat codex-lb's `codex_previous_response_stale` ("anchor expired") and upstream's "No tool call found for function call output with call_id …" (codex-lb replayed a turn upstream and the pinned downstream response id no longer matches the response holding the tool calls) as retry-without-`previous_response_id` signals. Without it omp short-circuits codex-lb's `response.failed` to "not stale" and fails the turn instead of retrying with full context. |
-| Transient upstream retry | `pi-ai/.../openai-codex-responses.ts` | Add codex-lb's transient codes (`upstream_error`, `upstream_request_timeout`) and transient-network messages (`upstream_unavailable` "Request to upstream timed out", `stream_incomplete` "websocket closed before response", connection-reset/closed/aborted, …) to omp's retryable classification, so a transient upstream blip retries (bounded, content-gated) instead of failing the turn — most visibly on session turn 1. Matches by message (not bare code) so TLS-cert failures, suppressed-duplicate-tool-call, auth/400/permission errors still surface. |
-
-Without the remote-compaction patch, long conversations fall back to local summarization (losing encrypted reasoning state). The web-search patch is only needed for `webSearch: tool` (native search card). The two recovery patches transparently retry codex-lb's transient/stale-anchor `response.failed`s instead of surfacing them.
-
-**Freeform `apply_patch`** no longer needs a patch: as of omp 15.x the freeform-vs-function decision is the per-model catalog field `applyPatchToolType`, so the plugin just sets `applyPatchToolType: "freeform"` on its models (override with `applyPatchToolType: function` per model in `models.yml`).
-
-## Patcher commands
+## Usage
 
 ```bash
-bunx github:YanzuoLu/omp-codex-lb-responses#main          # apply
-bunx github:YanzuoLu/omp-codex-lb-responses#main --check   # verify
-bunx github:YanzuoLu/omp-codex-lb-responses#main --revert  # undo
+omp --model codex-lb/gpt-5.5            # interactive
+omp -p --model codex-lb/gpt-5.5 "…"    # headless
 ```
 
-## After `omp update`
+Or pick `codex-lb/<model>` in the model picker. The default catalog is `gpt-5.5`,
+`gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark` (reasoning models).
 
-The plugin survives updates. Patches don't — re-apply:
+## How it works
+
+- **Provider registration** (`pi.registerProvider`): registers `codex-lb` with a
+  custom api id (`codex-lb-responses`) and a `streamSimple` wrapper. The models are
+  registered **programmatically** (inline), so no `models.yml` is needed — and
+  omp's YAML schema, which rejects custom api ids, is sidestepped.
+- **Plain-key Responses** (`streamSimple` → `streamOpenAIResponses`): each turn is
+  delegated to omp's built-in `openai-responses` path with a bare
+  `Authorization: Bearer <key>` (no ChatGPT JWT, no `chatgpt-account-id`). The
+  custom model has no catalog entry, so the plugin builds the standard
+  `openai-responses` `compat` itself (`buildOpenAIResponsesCompat`).
+- **WebSocket transport** (`src/ws-bridge.ts` + `src/ws-pool.ts`, the provider's
+  `fetch`): a streaming Responses POST to `/responses` is upgraded to a
+  `wss://…/responses` WebSocket. It sends `{ "type": "response.create", … }` and
+  translates the `response.*` frames back into the `data:`-framed SSE stream omp's
+  `readSseJson` decoder expects (terminated by `data: [DONE]`). codex-lb vendor
+  frames (`codex.rate_limits`, `codex.keepalive`) are filtered out.
+- **Account stickiness** (session-keyed pool): one socket per conversation, keyed
+  by omp's `sessionId` (the id omp hands to `streamSimple`, plus a `session-id`
+  header on the socket). Subsequent turns in the same conversation reuse the same
+  socket.
+- **Fail-closed & resilient**: codex-lb degraded states (e.g. `429
+  account_stream_cap`, "No available accounts") surface as a real error instead of
+  a silent empty turn. A socket that dies before a terminal event yields a
+  synthetic retryable error frame, so omp replays the turn (bounded), then falls
+  back to plain HTTP after the WebSocket retry budget is exhausted.
+- **No globals patched, no source patched.** The fetch override is per-provider,
+  the auth is a plain key, and the two omp behaviors that *are* hardcoded to the
+  built-in `openai-codex` provider — remote compaction and the native web-search
+  card — are intentionally **not** used (web search is available in plugin-only
+  `inject` mode instead).
+
+## Migrating from 0.17.x
+
+- **Uninstall the old patcher.** If you ran `bunx …omp-codex-lb-responses` to patch
+  omp, revert it: `bunx github:YanzuoLu/omp-codex-lb-responses#<old-tag> --revert`
+  (or just reinstall omp). 0.18 needs no patches.
+- **Remove the `codex-lb` provider from `~/.omp/agent/models.yml`** — it is no
+  longer read. Configure via the environment variables above instead.
+- Reinstall the plugin at the new tag and set both `CODEX_LB_API_KEY` and
+  `CODEX_LB_BASE_URL` (your codex-lb `/v1` endpoint).
+- **Lost vs 0.17:** omp's remote compaction (long conversations fall back to local
+  summarization) and the native web-search **card** (use `CODEX_LB_WEB_SEARCH=inject`
+  for hosted search without the card). Everything else — WebSocket transport,
+  account stickiness, encrypted reasoning, transient-failure resilience — is kept,
+  without the patcher/monkeypatch/JWT machinery.
+
+## Development
 
 ```bash
-bunx github:YanzuoLu/omp-codex-lb-responses#main
+bun install
+bun test          # unit tests: ws-bridge, ws-pool, index
+
+# end-to-end against a local mock codex-lb (zero deps, Bun):
+bun test/mock-codex-lb.mjs 8531 ok "HELLO"   # modes: ok | error429 | closeEarly | hang
+CODEX_LB_API_KEY=sk-test CODEX_LB_BASE_URL=http://127.0.0.1:8531/v1 \
+  omp -p --model codex-lb/gpt-5.5 -e src/index.ts "say hi"
 ```
 
-## Uninstall
+## Releases
 
-```bash
-bunx github:YanzuoLu/omp-codex-lb-responses#main --revert
-omp plugin uninstall omp-codex-lb-responses
+Releases are tagged `vX.Y.Z` matching `package.json`. Install by referencing the tag.
 ```
-
-## Security
-
-- Real API keys are only sent to your configured `baseUrl`
-- The synthetic JWT exists only inside the omp process and is never sent over the network
-- Do not commit `apiKey` values to version control

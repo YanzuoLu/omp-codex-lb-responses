@@ -1,804 +1,127 @@
-import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { AssistantMessageEventStream, streamOpenAICodexResponses } from "@oh-my-pi/pi-ai";
-import { getAgentDir as getOmpAgentDir } from "@oh-my-pi/pi-utils/dirs";
-import type { Context, Model, OpenAICodexResponsesOptions, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
-import { parse as parseYaml } from "yaml";
+// omp-codex-lb-responses
+//
+// Registers a `codex-lb` provider that reuses omp's built-in **openai-responses**
+// code path (plain `Authorization: Bearer` — no ChatGPT JWT, no account-id) but
+// routes each streaming turn through codex-lb's `/responses` WebSocket via a
+// PROVIDER-SCOPED `fetch`. One socket per conversation keeps codex-lb pinned to a
+// single upstream account — the session/account consistency the load balancer
+// needs — so long turns stop dropping silently.
+//
+// No global monkeypatching, no synthetic JWT, no source patcher. Configured by
+// environment: CODEX_LB_API_KEY (required) + CODEX_LB_BASE_URL (optional). Switch
+// to it by selecting `codex-lb/<model>` in the model picker.
 
-const CODEX_API = "openai-codex-responses";
-const CODEX_LB_API = "codex-lb-responses";
-const LEGACY_REAL_TOKEN_HEADER = "x-omp-codex-lb-token";
-const SHIM_KEY = Symbol.for("omp.codex-lb-responses.transport-shim");
-const WEB_SEARCH_CONFIG_KEY = Symbol.for("omp.codex-lb-responses.web-search");
-const TOKEN_FINGERPRINT_BYTES = 16;
-const DEFAULT_CONTEXT_WINDOW = 272000;
-const DEFAULT_MAX_TOKENS = 128000;
+import { AssistantMessageEventStream, streamOpenAIResponses } from "@oh-my-pi/pi-ai";
+import type { Context, Model } from "@oh-my-pi/pi-ai";
+import { buildOpenAIResponsesCompat } from "@oh-my-pi/pi-catalog";
+import { createWebSocketFetch, type FetchLike, type WebSocketFetch } from "./ws-pool";
+
+const SERVICE = "omp-codex-lb-responses";
+/** Custom api id omp dispatches to our streamSimple (must not collide with a built-in). */
+const CUSTOM_API = "codex-lb-responses";
+/** Built-in plain-key Responses path we delegate to under the hood. */
+const INNER_API = "openai-responses";
+const DEFAULT_PROVIDER_ID = "codex-lb";
+
 const DEFAULT_COST = { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 };
+const DEFAULT_CONTEXT_WINDOW = 272_000;
+const DEFAULT_MAX_TOKENS = 128_000;
+
+type ModelEntry = {
+	id: string;
+	name: string;
+	api: string;
+	reasoning: boolean;
+	input: ("text" | "image")[];
+	cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+	contextWindow: number;
+	maxTokens: number;
+};
+
+export interface CodexLbConfig {
+	providerID: string;
+	baseUrl: string;
+	apiKey: string;
+	models: ModelEntry[];
+	injectWebSearch: boolean;
+}
+
+type ProviderConfig = {
+	api?: string;
+	baseUrl?: string;
+	apiKey?: string;
+	streamSimple?: (model: Model, context: Context, options?: Record<string, unknown>) => AssistantMessageEventStream;
+	models?: ModelEntry[];
+	headers?: Record<string, string>;
+};
 
 type ExtensionApi = {
 	setLabel?: (label: string) => void;
-	registerProvider: (name: string, config: {
-		baseUrl?: string;
-		apiKey?: string;
-		api: string;
-		streamSimple?: (
-			model: Model,
-			context: Context,
-			options?: SimpleStreamOptions,
-		) => AssistantMessageEventStream;
-		headers?: Record<string, string>;
-		authHeader?: boolean;
-		models?: Array<Record<string, unknown>>;
-		compat?: Record<string, unknown>;
-	}) => void;
+	logger?: { warn?: (msg: string, meta?: unknown) => void; info?: (msg: string, meta?: unknown) => void };
+	on?: (event: string, handler: (payload: unknown) => void) => void;
+	registerProvider: (name: string, config: ProviderConfig) => void;
 };
 
-type RawCost = { input?: unknown; output?: unknown; cacheRead?: unknown; cacheWrite?: unknown };
-type RawModel = Record<string, unknown> & {
-	id?: unknown;
-	name?: unknown;
-	api?: unknown;
-	reasoning?: unknown;
-	input?: unknown;
-	cost?: RawCost;
-	contextWindow?: unknown;
-	maxTokens?: unknown;
-};
-type RawProvider = {
-	baseUrl?: unknown;
-	apiKey?: unknown;
-	api?: unknown;
-	headers?: unknown;
-	authHeader?: unknown;
-	models?: unknown;
-	compat?: unknown;
-	webSearch?: unknown;
-	webSearchOptions?: unknown;
-};
-type ModelsConfig = { providers?: Record<string, RawProvider> };
-type ShimState = {
-	tokens: Map<string, string>;
-	fetchInstalled: boolean;
-	webSocketInstalled: boolean;
-	/** ws/wss URL prefixes of codex-lb providers that opted into hosted web search. */
-	webSearchWsPrefixes: Set<string>;
-};
-
-function getShimState(): ShimState {
-	const globalRecord = globalThis as typeof globalThis & Record<symbol, ShimState | undefined>;
-	let state = globalRecord[SHIM_KEY];
-	if (!state) {
-		state = { tokens: new Map(), fetchInstalled: false, webSocketInstalled: false, webSearchWsPrefixes: new Set() };
-		globalRecord[SHIM_KEY] = state;
-	}
-	return state;
-}
-
-function createFakeCodexJwt(accountId: string): string {
-	const header = Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url");
-	const payload = Buffer.from(JSON.stringify({
-		"https://api.openai.com/auth": { chatgpt_account_id: accountId },
-	})).toString("base64url");
-	return `${header}.${payload}.codexlb`;
-}
-
-function createFakeAccountId(providerName: string, baseUrl: string, realApiKey: string): string {
-	const hash = createHash("sha256")
-		.update(`${providerName}\0${baseUrl}\0${realApiKey}`)
-		.digest("base64url")
-		.slice(0, TOKEN_FINGERPRINT_BYTES);
-	return `codex-lb-${hash}`;
-}
-
-function createFakeApiKey(providerName: string, baseUrl: string, realApiKey: string): string {
-	return createFakeCodexJwt(createFakeAccountId(providerName, baseUrl, realApiKey));
-}
-
-function getAgentDir(): string {
-	return getOmpAgentDir();
-}
-
-function readModelsConfig(): ModelsConfig | undefined {
-	for (const name of ["models.yml", "models.yaml"]) {
-		const path = join(getAgentDir(), name);
-		if (!existsSync(path)) continue;
-		try {
-			const parsed = parseYaml(readFileSync(path, "utf8"));
-			return parsed && typeof parsed === "object" ? parsed as ModelsConfig : undefined;
-		} catch {
-			return undefined;
-		}
-	}
-	return undefined;
-}
-
-function asNonEmptyString(value: unknown): string | undefined {
-	if (typeof value !== "string") return undefined;
-	const trimmed = value.trim();
-	return trimmed.length > 0 ? trimmed : undefined;
-}
-
-function asPositiveNumber(value: unknown, fallback: number): number {
-	const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
-	return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-function asHeaders(value: unknown): Record<string, string> | undefined {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-	const out: Record<string, string> = {};
-	for (const [key, headerValue] of Object.entries(value)) {
-		if (typeof headerValue === "string") out[key] = headerValue;
-	}
-	return Object.keys(out).length > 0 ? out : undefined;
-}
-
-function asPlainRecord(value: unknown): Record<string, unknown> | undefined {
-	return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-}
-
-function resolveConfiguredApiKey(apiKey: string): string {
-	return process.env[apiKey]?.trim() || apiKey;
-}
-
-function decodeJwtPayload(token: string): Record<string, unknown> | undefined {
-	const parts = token.split(".");
-	if (parts.length < 2) return undefined;
-	try {
-		const decoded = Buffer.from(parts[1]!, "base64url").toString("utf8");
-		const parsed = JSON.parse(decoded);
-		return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-function tokenHasCodexAccountId(token: string): boolean {
-	const payload = decodeJwtPayload(token);
-	const auth = payload?.["https://api.openai.com/auth"];
-	return Boolean(
-		auth &&
-			typeof auth === "object" &&
-			"chatgpt_account_id" in auth &&
-			typeof (auth as { chatgpt_account_id?: unknown }).chatgpt_account_id === "string" &&
-			(auth as { chatgpt_account_id: string }).chatgpt_account_id.length > 0,
-	);
-}
-
-function isOfficialCodexBaseUrl(baseUrl: string): boolean {
-	let url: URL;
-	try {
-		url = new URL(baseUrl);
-	} catch {
-		return false;
-	}
-	const path = url.pathname.replace(/\/+$/, "");
-	const responsesPath = path.endsWith("/responses") ? path : `${path}/responses`;
-	return url.origin === "https://chatgpt.com" && responsesPath === "/backend-api/codex/responses";
-}
-
-function providerUsesOnlyCodexResponses(provider: RawProvider, models: RawModel[]): boolean {
-	if (models.length === 0) return false;
-	for (const model of models) {
-		const api = asNonEmptyString(model.api ?? provider.api);
-		if (api !== CODEX_API) return false;
-	}
-	return true;
-}
-
-function shouldWrapProvider(provider: RawProvider, models: RawModel[]): boolean {
-	const baseUrl = asNonEmptyString(provider.baseUrl);
-	const apiKey = asNonEmptyString(provider.apiKey);
-	if (!baseUrl || !apiKey) return false;
-	if (!providerUsesOnlyCodexResponses(provider, models)) return false;
-	if (isOfficialCodexBaseUrl(baseUrl)) return false;
-	return !tokenHasCodexAccountId(resolveConfiguredApiKey(apiKey));
-}
-
-function normalizeModel(model: RawModel): Record<string, unknown> | undefined {
-	const id = asNonEmptyString(model.id);
-	if (!id) return undefined;
-	const input = Array.isArray(model.input)
-		? model.input.filter((value): value is "text" | "image" => value === "text" || value === "image")
-		: ["text"];
-	const cost = model.cost && typeof model.cost === "object" ? model.cost : DEFAULT_COST;
-	const headers = asHeaders(model.headers);
+function modelEntry(id: string, opts: { name?: string; context?: number; output?: number; attachment?: boolean } = {}): ModelEntry {
 	return {
-		...model,
 		id,
-		name: asNonEmptyString(model.name) ?? id,
-		api: CODEX_LB_API,
-		reasoning: typeof model.reasoning === "boolean" ? model.reasoning : true,
-		input: input.length > 0 ? input : ["text"],
-		// codex-lb proxies first-party GPT-5/Codex models, which support the freeform
-		// `apply_patch` custom tool. omp gates that on the per-model catalog field
-		// `applyPatchToolType` (the old provider-name source patch is gone as of 15.x),
-		// and codex-lb models aren't in the bundled catalog — so default to "freeform"
-		// here. A user can opt back to the function shape with `applyPatchToolType: function`.
-		applyPatchToolType: model.applyPatchToolType === "function" ? "function" : "freeform",
-		contextWindow: asPositiveNumber(model.contextWindow, DEFAULT_CONTEXT_WINDOW),
-		maxTokens: asPositiveNumber(model.maxTokens, DEFAULT_MAX_TOKENS),
-		cost: {
-			input: asPositiveNumber(cost.input, DEFAULT_COST.input),
-			output: asPositiveNumber(cost.output, DEFAULT_COST.output),
-			cacheRead: typeof cost.cacheRead === "number" ? cost.cacheRead : DEFAULT_COST.cacheRead,
-			cacheWrite: typeof cost.cacheWrite === "number" ? cost.cacheWrite : DEFAULT_COST.cacheWrite,
-		},
-		...(headers ? { headers } : {}),
+		name: opts.name ?? id,
+		api: CUSTOM_API,
+		reasoning: true,
+		input: opts.attachment === false ? ["text"] : ["text", "image"],
+		cost: { ...DEFAULT_COST },
+		contextWindow: opts.context ?? DEFAULT_CONTEXT_WINDOW,
+		maxTokens: opts.output ?? DEFAULT_MAX_TOKENS,
 	};
 }
 
-type WebSearchMode = "off" | "inject" | "tool";
-type CodexLbWebSearchConfig = {
-	baseUrl: string;
-	apiKey: string;
-	accountId: string;
-	/** web_search tool object the patched search provider sends (Codex-aligned). */
-	searchTool: Record<string, unknown>;
-	/** reasoning effort for the search sub-request; undefined when auto-tracking. */
-	reasoningEffort?: string;
-	/** when true, reasoningEffort is kept in sync with the main model each turn. */
-	reasoningAuto: boolean;
-	/** hard timeout for the search request, in ms. */
-	searchTimeoutMs: number;
-};
-
-function parseWebSearchMode(value: unknown): WebSearchMode {
-	if (value === true || value === "inject") return "inject";
-	if (value === "tool") return "tool";
-	return "off";
-}
-
-const SEARCH_CONTEXT_SIZES = new Set(["low", "medium", "high"]);
-
-/**
- * Builds the codex-lb web-search config from a provider's `webSearchOptions`,
- * defaulting to Codex CLI's captured request shape: medium context, the
- * web_search tool spec, a 180s timeout, and reasoning matched to the main model.
- */
-function buildCodexLbWebSearchConfig(
-	baseUrl: string,
-	fakeApiKey: string,
-	accountId: string,
-	rawOptions: unknown,
-): CodexLbWebSearchConfig {
-	const opts = asPlainRecord(rawOptions) ?? {};
-	const contextSize =
-		typeof opts.contextSize === "string" && SEARCH_CONTEXT_SIZES.has(opts.contextSize) ? opts.contextSize : "medium";
-	const country = typeof opts.userLocationCountry === "string" ? opts.userLocationCountry.trim() : "US";
-	const toolOverride = asPlainRecord(opts.tool);
-	const searchTool: Record<string, unknown> = toolOverride ?? {
-		type: "web_search",
-		return_token_budget: "default",
-		search_context_size: contextSize,
-		...(country && country.toLowerCase() !== "none" ? { user_location: { type: "approximate", country } } : {}),
-	};
-	const reasoningRaw = typeof opts.reasoningEffort === "string" ? opts.reasoningEffort.trim() : "auto";
-	const reasoningAuto = reasoningRaw === "" || reasoningRaw === "auto";
-	return {
-		baseUrl,
-		apiKey: fakeApiKey,
-		accountId,
-		searchTool,
-		reasoningEffort: reasoningAuto ? undefined : reasoningRaw,
-		reasoningAuto,
-		searchTimeoutMs: asPositiveNumber(opts.timeoutSeconds, 180) * 1000,
-	};
+export function defaultModels(): ModelEntry[] {
+	return [
+		modelEntry("gpt-5.5", { name: "GPT-5.5" }),
+		modelEntry("gpt-5.4", { name: "GPT-5.4" }),
+		modelEntry("gpt-5.4-mini", { name: "GPT-5.4-Mini" }),
+		modelEntry("gpt-5.3-codex-spark", { name: "GPT-5.3-Codex-Spark", context: 128_000, attachment: false }),
+	];
 }
 
 /**
- * Publishes the codex-lb web-search config for the patched omp `codex` search
- * provider (see bin/patch.mjs) to read, so omp's native web-search card runs
- * through codex-lb (over WebSocket, via the fetch shim) instead of the official
- * ChatGPT OAuth endpoint. First `tool`-mode provider wins.
+ * Reads codex-lb config from the environment. Returns undefined unless BOTH
+ * `CODEX_LB_API_KEY` and `CODEX_LB_BASE_URL` are set — the base URL has no
+ * built-in default, so a codex-lb host is never baked into this package.
  */
-function setCodexLbWebSearchConfig(config: CodexLbWebSearchConfig): void {
-	const record = globalThis as typeof globalThis & Record<symbol, CodexLbWebSearchConfig | undefined>;
-	if (!record[WEB_SEARCH_CONFIG_KEY]) record[WEB_SEARCH_CONFIG_KEY] = config;
+export function readConfig(env: Record<string, string | undefined> = process.env): CodexLbConfig | undefined {
+	const apiKey = env.CODEX_LB_API_KEY?.trim();
+	const baseUrlRaw = env.CODEX_LB_BASE_URL?.trim();
+	if (!apiKey || !baseUrlRaw) return undefined;
+	const baseUrl = baseUrlRaw.replace(/\/+$/, "");
+	const providerID = env.CODEX_LB_PROVIDER_ID?.trim() || DEFAULT_PROVIDER_ID;
+	const webSearch = env.CODEX_LB_WEB_SEARCH?.trim().toLowerCase();
+	const injectWebSearch = webSearch === "inject" || webSearch === "true";
+	const ids = env.CODEX_LB_MODELS?.split(",").map((s) => s.trim()).filter(Boolean);
+	const models = ids && ids.length > 0 ? ids.map((id) => modelEntry(id)) : defaultModels();
+	return { providerID, baseUrl, apiKey, models, injectWebSearch };
 }
 
-/** Keep the search sub-request's reasoning effort in sync with the main model. */
-function trackMainModelReasoning(effort: unknown): void {
-	const record = globalThis as typeof globalThis & Record<symbol, CodexLbWebSearchConfig | undefined>;
-	const config = record[WEB_SEARCH_CONFIG_KEY];
-	if (config?.reasoningAuto && typeof effort === "string" && effort.length > 0) {
-		config.reasoningEffort = effort;
-	}
-}
+type InnerStream = (model: Model, context: Context, options?: Record<string, unknown>) => AssistantMessageEventStream;
+type EventStreamCtor = new () => AssistantMessageEventStream;
+type BuildCompat = (spec: { id?: string; provider: string; name: string; baseUrl: string; reasoning?: boolean }) => unknown;
 
-function discoverCodexLbProviders(): Array<{
-	name: string;
-	baseUrl: string;
-	realApiKey: string;
-	fakeApiKey: string;
-	headers?: Record<string, string>;
-	authHeader?: boolean;
-	models: Array<Record<string, unknown>>;
-	compat?: Record<string, unknown>;
-	webSearch: WebSearchMode;
-	webSearchOptions?: Record<string, unknown>;
-}> {
-	const providers = readModelsConfig()?.providers;
-	if (!providers) return [];
-	const discovered = [];
-	for (const [name, provider] of Object.entries(providers)) {
-		if (!provider || typeof provider !== "object") continue;
-		const rawModels = Array.isArray(provider.models) ? provider.models as RawModel[] : [];
-		if (!shouldWrapProvider(provider, rawModels)) continue;
-		const models = rawModels.map(normalizeModel).filter((model): model is Record<string, unknown> => Boolean(model));
-		const baseUrl = asNonEmptyString(provider.baseUrl);
-		const apiKey = asNonEmptyString(provider.apiKey);
-		if (!baseUrl || !apiKey || models.length === 0) continue;
-		const realApiKey = resolveConfiguredApiKey(apiKey);
-		const fakeApiKey = createFakeApiKey(name, baseUrl, realApiKey);
-		discovered.push({
-			name,
-			baseUrl,
-			realApiKey,
-			fakeApiKey,
-			headers: asHeaders(provider.headers),
-			authHeader: typeof provider.authHeader === "boolean" ? provider.authHeader : undefined,
-			models,
-			compat: asPlainRecord(provider.compat),
-			webSearch: parseWebSearchMode(provider.webSearch),
-			webSearchOptions: asPlainRecord(provider.webSearchOptions),
-		});
-	}
-	return discovered;
-}
-
-function rewriteCodexLbHeaders(init: HeadersInit | undefined): HeadersInit | undefined {
-	if (!init) return init;
-	const headers = new Headers(init);
-	const authorization = headers.get("authorization") ?? headers.get("Authorization");
-	const bearerToken = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : undefined;
-	const realToken = bearerToken ? getShimState().tokens.get(bearerToken) : undefined;
-	if (!realToken) return init;
-
-	headers.set("Authorization", `Bearer ${realToken}`);
-	headers.delete("chatgpt-account-id");
-	headers.delete(LEGACY_REAL_TOKEN_HEADER);
-	return headers;
-}
-
-function toWsUrl(httpUrl: string): string {
-	return httpUrl.replace(/^https:/, "wss:").replace(/^http:/, "ws:");
-}
-
-function isCodexLbSseRequest(url: string, headers: Headers): boolean {
-	const authorization = headers.get("authorization") ?? headers.get("Authorization");
-	const bearerToken = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : undefined;
-	if (!bearerToken || !getShimState().tokens.has(bearerToken)) return false;
-	const accept = headers.get("accept") ?? "";
-	return accept.includes("text/event-stream");
-}
-
-const WS_PROXY_CONNECT_TIMEOUT_MS = 10_000;
-const WS_PROXY_FIRST_EVENT_TIMEOUT_MS = 60_000;
-const WS_PROXY_IDLE_TIMEOUT_MS = 300_000;
-const WS_PROXY_KEEPALIVE_EVENT = "codex.keepalive";
-const WS_PROXY_TERMINAL_EVENTS = new Set([
-	"response.completed", "response.done", "response.incomplete", "response.failed", "error",
-]);
-const CODEX_PROVIDER_SESSION_STATE_KEY = "openai-codex-responses";
-const WS_RELATCH_COOLDOWN_MS = 30_000;
-
-function fetchViaWebSocket(url: string, init: RequestInit): Promise<Response> {
-	const headers = new Headers(init.headers);
-	const rewritten = rewriteCodexLbHeaders(headers) as Headers;
-	rewritten.delete("accept");
-	rewritten.delete("content-type");
-	const betaHeader = rewritten.get("openai-beta");
-	if (betaHeader && betaHeader.includes("responses=")) {
-		rewritten.set("openai-beta", betaHeader.replace(/responses=[^\s,;]+/, "responses_websockets=2026-02-06"));
-	}
-	const headerRecord: Record<string, string> = {};
-	for (const [k, v] of rewritten.entries()) headerRecord[k] = v;
-
-	return new Promise((resolve, reject) => {
-		const wsUrl = toWsUrl(url);
-		const ws = new WebSocket(wsUrl, { headers: headerRecord } as unknown as string[]);
-		(ws as unknown as { binaryType: string }).binaryType = "nodebuffer";
-		const signal = init.signal;
-		let settled = false;
-		let streamClosed = false;
-		let sawFirstEvent = false;
-		let sawTerminal = false;
-		let lastProgressAt = 0;
-		let connectTimer: ReturnType<typeof setTimeout> | undefined;
-		let eventTimer: ReturnType<typeof setTimeout> | undefined;
-		let controllerRef: ReadableStreamDefaultController<Uint8Array> | undefined;
-
-		const teardown = () => {
-			if (connectTimer) { clearTimeout(connectTimer); connectTimer = undefined; }
-			if (eventTimer) { clearTimeout(eventTimer); eventTimer = undefined; }
-			signal?.removeEventListener("abort", onAbort);
-			if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-				ws.close(1000, "teardown");
-			}
-		};
-
-		const closeStream = (reason?: Error) => {
-			if (streamClosed) return;
-			streamClosed = true;
-			teardown();
-			if (!controllerRef) return;
-			if (reason) {
-				try { controllerRef.error(reason); } catch {}
-			} else {
-				try { controllerRef.close(); } catch {}
-			}
-		};
-
-		// End the proxied SSE stream with a synthetic, RETRYABLE error frame when the
-		// upstream WebSocket dies before a terminal event (codex-lb idle-closes with
-		// code 1001 and no terminal frame, and silently swallows failed terminal
-		// sends). A clean `controller.close()` here would make omp's SSE reader see a
-		// graceful EOF and throw the UNRECOVERABLE "Codex stream ended before terminal
-		// completion event". Instead we mirror omp's native-WS transport, which raises
-		// a retryable error on a close-before-completion: emitting an `error` frame
-		// whose `code` is in omp's retryable set lets omp's SSE recovery replay the
-		// turn (bounded by CODEX_MAX_RETRIES, and only while no content has streamed —
-		// tool-call blocks count as content, so a finished turn is never re-run). The
-		// honest cause rides in `message` so it stays visible in logs; `code` is only
-		// the classifier key.
-		const failRetryable = (message: string) => {
-			if (streamClosed) return;
-			if (controllerRef) {
-				const frame = `event: error\ndata: ${JSON.stringify({ type: "error", code: "server_error", message })}\n\n`;
-				try { controllerRef.enqueue(new TextEncoder().encode(frame)); } catch {}
-			}
-			closeStream();
-		};
-
-		// Two-phase liveness, mirroring omp's native WS transport: wait up to
-		// WS_PROXY_FIRST_EVENT_TIMEOUT_MS for the first frame, then enforce an idle
-		// ceiling measured from the last *progress* frame. codex.keepalive frames
-		// keep the socket alive server-side but are NOT progress — resetting the
-		// timer on them is what let a stuck upstream spin forever (the old bug).
-		const armEventTimer = () => {
-			if (eventTimer) clearTimeout(eventTimer);
-			const ms = sawFirstEvent
-				? Math.max(0, WS_PROXY_IDLE_TIMEOUT_MS - (Date.now() - lastProgressAt))
-				: WS_PROXY_FIRST_EVENT_TIMEOUT_MS;
-			eventTimer = setTimeout(() => {
-				failRetryable(sawFirstEvent ? "WebSocket proxy idle timeout" : "WebSocket proxy first-event timeout");
-			}, ms);
-		};
-
-		const onAbort = () => {
-			if (!settled) {
-				settled = true;
-				teardown();
-				reject(new Error("Request was aborted"));
-				return;
-			}
-			closeStream(new Error("Request was aborted"));
-		};
-		signal?.addEventListener("abort", onAbort);
-
-		connectTimer = setTimeout(() => {
-			if (settled) return;
-			settled = true;
-			teardown();
-			reject(new Error("WebSocket proxy connect timeout"));
-		}, WS_PROXY_CONNECT_TIMEOUT_MS);
-
-		ws.addEventListener("open", () => {
-			if (connectTimer) { clearTimeout(connectTimer); connectTimer = undefined; }
-			let body: Record<string, unknown>;
-			try {
-				body = JSON.parse(init.body as string);
-			} catch {
-				settled = true;
-				teardown();
-				reject(new Error("Failed to parse request body"));
-				return;
-			}
-			body.type = "response.create";
-			ws.send(JSON.stringify(body));
-			lastProgressAt = Date.now();
-			armEventTimer();
-
-			const encoder = new TextEncoder();
-			const stream = new ReadableStream<Uint8Array>({
-				start(controller) {
-					controllerRef = controller;
-					ws.addEventListener("message", (event: MessageEvent) => {
-						if (streamClosed) return;
-						const text = typeof event.data === "string"
-							? event.data
-							: Buffer.isBuffer(event.data) ? event.data.toString("utf8") : String(event.data);
-						let parsed: Record<string, unknown>;
-						try { parsed = JSON.parse(text); } catch { return; }
-						const eventType = typeof parsed.type === "string" ? parsed.type : "";
-						const isKeepalive = eventType === WS_PROXY_KEEPALIVE_EVENT;
-						// Any frame ends the first-event phase; only progress (non-keepalive)
-						// frames reset the idle window so keepalive-only streams still time out.
-						if (!sawFirstEvent) {
-							sawFirstEvent = true;
-							if (!isKeepalive) lastProgressAt = Date.now();
-							armEventTimer();
-						} else if (!isKeepalive) {
-							lastProgressAt = Date.now();
-							armEventTimer();
-						}
-						if (!eventType || isKeepalive) return;
-						const sseChunk = `event: ${eventType}\ndata: ${text}\n\n`;
-						try { controller.enqueue(encoder.encode(sseChunk)); } catch { return; }
-						if (WS_PROXY_TERMINAL_EVENTS.has(eventType)) {
-							sawTerminal = true;
-							closeStream();
-						}
-					});
-					// A close without a forwarded terminal event is a premature death, not a
-					// graceful end — surface it as retryable so omp recovers instead of
-					// throwing "stream ended before terminal completion event".
-					ws.addEventListener("close", () => {
-						if (sawTerminal) closeStream();
-						else failRetryable("codex-lb websocket closed before terminal completion event");
-					});
-					ws.addEventListener("error", (e: Event) => {
-						failRetryable(`WebSocket error: ${(e as ErrorEvent).message ?? "unknown"}`);
-					});
-				},
-				cancel() { closeStream(); },
-			});
-
-			settled = true;
-			resolve(new Response(stream, {
-				status: 200,
-				statusText: "OK",
-				headers: { "content-type": "text/event-stream; charset=utf-8" },
-			}));
-		});
-
-		ws.addEventListener("error", (e: Event) => {
-			if (!settled) {
-				settled = true;
-				teardown();
-				reject(new Error(`WebSocket connection failed: ${(e as ErrorEvent).message ?? "unknown"}`));
-			}
-		});
-
-		ws.addEventListener("close", (e: CloseEvent) => {
-			if (!settled) {
-				settled = true;
-				teardown();
-				reject(new Error(`WebSocket closed before open: ${e.code} ${e.reason}`));
-			}
-		});
-	});
-}
-
-function installCodexLbFetchShim(): void {
-	const state = getShimState();
-	if (state.fetchInstalled) return;
-	const nativeFetch = globalThis.fetch;
-	if (typeof nativeFetch !== "function") return;
-	const shimFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
-		const url = input instanceof Request ? input.url : input.toString();
-		const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
-		if (isCodexLbSseRequest(url, headers) && init?.body) {
-			return fetchViaWebSocket(url, init);
-		}
-		if (init?.headers) {
-			return nativeFetch(input, { ...init, headers: rewriteCodexLbHeaders(init.headers) });
-		}
-		if (input instanceof Request) {
-			const rewritten = rewriteCodexLbHeaders(input.headers);
-			if (rewritten !== input.headers) return nativeFetch(new Request(input, { headers: rewritten }), init);
-		}
-		return nativeFetch(input, init);
-	}) as typeof fetch;
-	const preconnect = (nativeFetch as typeof fetch & { preconnect?: unknown }).preconnect;
-	if (typeof preconnect === "function") {
-		(shimFetch as typeof fetch & { preconnect?: unknown }).preconnect = preconnect.bind(nativeFetch);
-	}
-	globalThis.fetch = shimFetch;
-	state.fetchInstalled = true;
-}
-
-const WEB_SEARCH_TOOL_TYPES = new Set(["web_search", "web_search_preview"]);
-
-/**
- * Injects the hosted `web_search` tool into a `response.create` frame — the same
- * thing the Codex CLI sends, which codex-lb forwards to the upstream ChatGPT
- * account. Returns the rewritten JSON, or undefined when nothing changed (not a
- * response.create, unparseable, or web search already present). omp's stream
- * handler tolerates the resulting `web_search_call` events (it stores the item
- * for history and ignores the rest), so the model's answer is web-informed even
- * though omp does not render the search-step UI.
- */
-export function injectWebSearchTool(payload: string): string | undefined {
-	let body: Record<string, unknown>;
-	try {
-		body = JSON.parse(payload);
-	} catch {
-		return undefined;
-	}
-	if (!body || body.type !== "response.create") return undefined;
-	const tools = Array.isArray(body.tools) ? (body.tools as Array<Record<string, unknown>>) : [];
-	// Already carries the hosted tool — leave it untouched.
-	if (tools.some(tool => tool && typeof tool === "object" && WEB_SEARCH_TOOL_TYPES.has(tool.type as string))) {
-		return undefined;
-	}
-	// Drop omp's client-side `web_search` FUNCTION tool if present: it would both
-	// duplicate the hosted tool and route the model's calls through omp's
-	// OAuth-gated client search provider. Replacing it with the hosted tool makes
-	// the search run server-side under the codex-lb account.
-	const filtered = tools.filter(
-		tool =>
-			!(tool && typeof tool === "object" && tool.type === "function" && WEB_SEARCH_TOOL_TYPES.has(tool.name as string)),
-	);
-	body.tools = [...filtered, { type: "web_search" }];
-	return JSON.stringify(body);
-}
-
-function shouldInjectWebSearch(url: string): boolean {
-	const prefixes = getShimState().webSearchWsPrefixes;
-	for (const prefix of prefixes) {
-		if (url.startsWith(prefix)) return true;
-	}
-	return false;
-}
-
-function wrapWebSocketSendForWebSearch(socket: unknown): void {
-	const target = socket as { send?: (data: unknown) => unknown };
-	if (typeof target.send !== "function") return;
-	const send = target.send.bind(target);
-	target.send = (data: unknown) => {
-		if (typeof data === "string") {
-			const injected = injectWebSearchTool(data);
-			if (injected !== undefined) return send(injected);
-		}
-		return send(data);
-	};
-}
-
-function installCodexLbWebSocketShim(): void {
-	const state = getShimState();
-	if (state.webSocketInstalled) return;
-
-	const NativeWebSocket = globalThis.WebSocket;
-	if (typeof NativeWebSocket !== "function") return;
-
-	globalThis.WebSocket = new Proxy(NativeWebSocket, {
-		construct(target, args, newTarget) {
-			const [url, options, ...rest] = args;
-			const nextOptions = options && typeof options === "object" ? { ...options } : options;
-			if (nextOptions && typeof nextOptions === "object" && "headers" in nextOptions) {
-				(nextOptions as { headers?: HeadersInit }).headers = rewriteCodexLbHeaders(
-					(nextOptions as { headers?: HeadersInit }).headers,
-				);
-			}
-			const instance = Reflect.construct(target, [url, nextOptions, ...rest], newTarget);
-			const urlString = typeof url === "string" ? url : ((url as { toString?: () => string })?.toString?.() ?? "");
-			if (shouldInjectWebSearch(urlString)) {
-				wrapWebSocketSendForWebSearch(instance);
-			}
-			return instance;
-		},
-	}) as typeof WebSocket;
-	state.webSocketInstalled = true;
-}
-
-function installCodexLbTransportShims(): void {
-	installCodexLbFetchShim();
-	installCodexLbWebSocketShim();
-}
-
-function resolveRealApiKey(apiKey: string): string {
-	return getShimState().tokens.get(apiKey) ?? apiKey;
-}
-
-/** @internal Exported for tests. */
-export function createCodexLbFetch(fetchOverride: typeof fetch | undefined): typeof fetch {
-	const baseFetch = fetchOverride ?? fetch;
-	const lbFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
-		// Upgrade codex-lb SSE → WebSocket HERE, before rewriting the bearer.
-		// The fake token is the only marker identifying a codex-lb request;
-		// rewriteCodexLbHeaders (the line below, and the global fetch shim) swaps
-		// it for the real token, after which isCodexLbSseRequest() can no longer
-		// recognize it — which is why the upgrade never fired on omp's native SSE
-		// fallback and those turns silently dropped to plain SSE.
-		if (init?.body) {
-			const url = input instanceof Request ? input.url : input.toString();
-			const headers = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined));
-			if (isCodexLbSseRequest(url, headers)) {
-				return fetchViaWebSocket(url, init);
-			}
-		}
-		return baseFetch(input, init ? { ...init, headers: rewriteCodexLbHeaders(init.headers) } : init);
-	}) as typeof fetch;
-	const preconnect = (baseFetch as typeof fetch & { preconnect?: unknown }).preconnect;
-	if (typeof preconnect === "function") {
-		(lbFetch as typeof fetch & { preconnect?: unknown }).preconnect = preconnect.bind(baseFetch);
-	}
-	return lbFetch;
-}
-
-type CodexWsSessionLike = { disableWebsocket?: boolean; lastFallbackAt?: number };
-type CodexProviderStateLike = { webSocketSessions?: Map<string, CodexWsSessionLike> };
-
-function reenableNativeWebSocket(providerSessionState: unknown): void {
-	// omp latches `disableWebsocket` on the first fatal WS failure (e.g. a 10s
-	// connect timeout under codex-lb load) and never clears it, so one transient
-	// hiccup pins the whole session to the slower SSE→WS path and loses native
-	// connection reuse / turn-state affinity. Clear the latch after a cooldown so
-	// the robust native transport is retried. Reaches into omp internals on
-	// purpose; guarded so an upstream rename degrades to a no-op.
-	if (!(providerSessionState instanceof Map)) return;
-	const codexState = providerSessionState.get(CODEX_PROVIDER_SESSION_STATE_KEY) as CodexProviderStateLike | undefined;
-	const sessions = codexState?.webSocketSessions;
-	if (!sessions || typeof sessions.values !== "function") return;
-	const now = Date.now();
-	for (const session of sessions.values()) {
-		if (session?.disableWebsocket === true && now - (session.lastFallbackAt ?? 0) >= WS_RELATCH_COOLDOWN_MS) {
-			session.disableWebsocket = false;
-		}
-	}
-}
-
-function streamCodexLb(
-	model: Model,
-	context: Context,
-	options?: SimpleStreamOptions,
-): AssistantMessageEventStream {
-	// omp 15.10+ widened SimpleStreamOptions.apiKey to `string | ApiKeyResolver`,
-	// but streamSimple() resolves a resolver to a string one level up before it ever
-	// reaches a custom-api provider (see pi-ai stream.ts), so by here it's always a
-	// string. Narrow defensively rather than feed a function to the token Map.
-	const apiKey = typeof options?.apiKey === "string" ? options.apiKey : undefined;
-	const realApiKey = apiKey ? resolveRealApiKey(apiKey) : undefined;
-	if (!realApiKey || realApiKey === "N/A") {
-		throw new Error(`No API key for provider: ${model.provider}`);
-	}
-
-	installCodexLbTransportShims();
-
-	const innerModel = { ...model, api: CODEX_API, headers: model.headers } as Model<"openai-codex-responses">;
-	const codexOptions = options as SimpleStreamOptions | undefined;
-	const providerSessionState = codexOptions?.providerSessionState ?? new Map();
-	reenableNativeWebSocket(providerSessionState);
-	trackMainModelReasoning(codexOptions?.disableReasoning ? "none" : codexOptions?.reasoning);
-	const ensuredSessionId = codexOptions?.sessionId ?? randomUUID();
-	const innerApiKey = createFakeApiKey(model.provider, model.baseUrl ?? "", realApiKey);
-
-	const innerOptions: OpenAICodexResponsesOptions = {
-		...codexOptions,
-		apiKey: innerApiKey,
-		sessionId: ensuredSessionId,
-		promptCacheKey: codexOptions?.promptCacheKey ?? codexOptions?.sessionId ?? ensuredSessionId,
-		providerSessionState,
-		preferWebsockets: true,
-		reasoning: codexOptions?.disableReasoning ? "none" : codexOptions?.reasoning as OpenAICodexResponsesOptions["reasoning"],
-		reasoningSummary: codexOptions?.hideThinkingSummary ? null : undefined,
-		fetch: createCodexLbFetch(codexOptions?.fetch),
-	};
-
-	getShimState().tokens.set(innerApiKey, realApiKey);
-	const inner = streamOpenAICodexResponses(innerModel, context, innerOptions);
-
-	const outer = new AssistantMessageEventStream();
+// Re-tag the inner openai-responses events with our custom api id so omp's
+// history/resume bookkeeping stays consistent with the registered model's api.
+function retagStream(inner: AssistantMessageEventStream, StreamCtor: EventStreamCtor): AssistantMessageEventStream {
+	const outer = new StreamCtor();
 	(async () => {
 		try {
-			for await (const event of inner) {
-				const ev = event as Record<string, unknown>;
-				if (ev.message && typeof ev.message === "object") {
-					(ev.message as Record<string, unknown>).api = CODEX_LB_API;
+			for await (const event of inner as AsyncIterable<Record<string, unknown>>) {
+				for (const key of ["message", "partial", "error"] as const) {
+					const part = event[key];
+					if (part && typeof part === "object") (part as Record<string, unknown>).api = CUSTOM_API;
 				}
-				if (ev.partial && typeof ev.partial === "object") {
-					(ev.partial as Record<string, unknown>).api = CODEX_LB_API;
-				}
-				if (ev.error && typeof ev.error === "object") {
-					(ev.error as Record<string, unknown>).api = CODEX_LB_API;
-				}
-				outer.push(event);
+				outer.push(event as never);
 			}
-			const result = await inner.result();
-			result.api = CODEX_LB_API as any;
-			outer.end(result);
+			const result = (await inner.result()) as Record<string, unknown>;
+			result.api = CUSTOM_API;
+			outer.end(result as never);
 		} catch (error) {
 			outer.fail(error);
 		}
@@ -806,42 +129,91 @@ function streamCodexLb(
 	return outer;
 }
 
-export default function codexLbResponses(pi: ExtensionApi): void {
-	pi.setLabel?.("Codex LB Responses");
-	installCodexLbTransportShims();
+export function makeStreamSimple(
+	config: CodexLbConfig,
+	pool: WebSocketFetch,
+	innerStream: InnerStream,
+	StreamCtor: EventStreamCtor,
+	buildCompat: BuildCompat = buildOpenAIResponsesCompat as unknown as BuildCompat,
+) {
+	return function streamCodexLb(model: Model, context: Context, options?: Record<string, unknown>): AssistantMessageEventStream {
+		const opts = (options ?? {}) as Record<string, unknown>;
+		const m = model as unknown as Record<string, unknown>;
+		const apiKey = typeof opts.apiKey === "string" && opts.apiKey ? (opts.apiKey as string) : config.apiKey;
+		const sessionID =
+			(typeof opts.sessionId === "string" && opts.sessionId) || (typeof opts.promptCacheKey === "string" && opts.promptCacheKey) || undefined;
+		const httpFetch = (typeof opts.fetch === "function" ? opts.fetch : globalThis.fetch) as FetchLike;
+		const wsFetch = pool.bind(sessionID || undefined, httpFetch);
 
-	pi.registerProvider(CODEX_LB_API, {
-		api: CODEX_LB_API,
-		streamSimple: streamCodexLb,
+		// omp resolves a built-in model's `compat` from its catalog; a custom-api model
+		// has none, and omp's openai-responses path reads `model.compat` directly
+		// (resolveOpenAICompatPolicy / buildResponsesInput). Build the standard
+		// openai-responses compat ourselves and put it on the inner model.
+		const compat = buildCompat({
+			id: typeof m.id === "string" ? m.id : undefined,
+			provider: typeof m.provider === "string" ? m.provider : config.providerID,
+			name: typeof m.name === "string" ? m.name : typeof m.id === "string" ? m.id : "gpt-5",
+			baseUrl: config.baseUrl,
+			reasoning: m.reasoning !== false,
+		});
+
+		const innerModel = { ...m, api: INNER_API, baseUrl: config.baseUrl, compat } as unknown as Model;
+		const innerOptions: Record<string, unknown> = {
+			...opts,
+			apiKey,
+			fetch: wsFetch,
+			// codex-lb proxies the Responses API; keep encrypted reasoning across the
+			// full-transcript replay (statefulResponses stays off for a non-OpenAI host).
+			includeEncryptedReasoning: true,
+			statefulResponses: false,
+			reasoningSummary: opts.reasoningSummary ?? "auto",
+		};
+
+		const inner = innerStream(innerModel, context, innerOptions);
+		return retagStream(inner, StreamCtor);
+	};
+}
+
+export interface ActivateDeps {
+	env?: Record<string, string | undefined>;
+	innerStream?: InnerStream;
+	AssistantMessageEventStream?: EventStreamCtor;
+	WebSocketImpl?: unknown;
+	createPool?: typeof createWebSocketFetch;
+}
+
+export function activate(pi: ExtensionApi, deps: ActivateDeps = {}): WebSocketFetch | undefined {
+	pi.setLabel?.("Codex LB Responses");
+	const config = readConfig(deps.env);
+	if (!config) {
+		pi.logger?.warn?.(`${SERVICE}: set CODEX_LB_API_KEY and CODEX_LB_BASE_URL (your codex-lb /v1 endpoint) to enable the codex-lb provider`);
+		return undefined;
+	}
+	const createPool = deps.createPool ?? createWebSocketFetch;
+	const pool = createPool({ injectWebSearch: config.injectWebSearch, WebSocketImpl: deps.WebSocketImpl });
+	const innerStream = deps.innerStream ?? (streamOpenAIResponses as unknown as InnerStream);
+	const StreamCtor = deps.AssistantMessageEventStream ?? (AssistantMessageEventStream as unknown as EventStreamCtor);
+
+	pi.registerProvider(config.providerID, {
+		api: CUSTOM_API,
+		baseUrl: config.baseUrl,
+		apiKey: config.apiKey,
+		streamSimple: makeStreamSimple(config, pool, innerStream, StreamCtor),
+		models: config.models,
 	});
 
-	for (const provider of discoverCodexLbProviders()) {
-		getShimState().tokens.set(provider.fakeApiKey, provider.realApiKey);
-		if (provider.webSearch === "inject") {
-			getShimState().webSearchWsPrefixes.add(toWsUrl(provider.baseUrl.replace(/\/+$/, "")));
-		} else if (provider.webSearch === "tool") {
-			// Publish the SYNTHETIC key, not the real one. The patched codex search
-			// provider sends an SSE request; with the synthetic bearer the global
-			// fetch shim recognizes it and upgrades it to WebSocket (rewriting auth
-			// + the openai-beta header). codex-lb's SSE path is unreliable (upstream
-			// 1011s), so the search MUST ride the same WS transport as everything else.
-			setCodexLbWebSearchConfig(
-				buildCodexLbWebSearchConfig(
-					provider.baseUrl.replace(/\/+$/, ""),
-					provider.fakeApiKey,
-					createFakeAccountId(provider.name, provider.baseUrl, provider.realApiKey),
-					provider.webSearchOptions,
-				),
-			);
-		}
-		pi.registerProvider(provider.name, {
-			baseUrl: provider.baseUrl,
-			apiKey: provider.fakeApiKey,
-			headers: provider.headers,
-			authHeader: provider.authHeader,
-			api: CODEX_LB_API,
-			models: provider.models,
-			compat: provider.compat,
-		});
-	}
+	// Drop a session's socket when omp ends it, if the host emits such an event.
+	pi.on?.("session-end", (payload) => {
+		const id = (payload as { sessionId?: string } | undefined)?.sessionId;
+		if (id) pool.remove(id);
+	});
+
+	pi.logger?.info?.(
+		`${SERVICE}: registered provider "${config.providerID}" (${config.models.length} models) over codex-lb WebSocket at ${config.baseUrl}`,
+	);
+	return pool;
+}
+
+export default function codexLbResponses(pi: ExtensionApi): void {
+	activate(pi);
 }

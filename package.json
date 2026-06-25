@@ -1,32 +1,32 @@
 {
   "name": "omp-codex-lb-responses",
-  "version": "0.17.1",
+  "version": "0.18.0",
   "type": "module",
   "private": false,
-  "description": "OMP plugin + patcher for Codex-compatible load-balanced backends.",
+  "description": "OMP plugin: a clean codex-lb provider that routes the OpenAI Responses API over codex-lb's WebSocket transport — no source patcher, no global monkeypatch, no synthetic JWT.",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/YanzuoLu/omp-codex-lb-responses.git"
   },
-  "bin": {
-    "omp-codex-lb-patch": "bin/patch.mjs"
-  },
   "omp": {
     "name": "Codex LB Responses",
-    "description": "SSE→WS upgrade and auth shim for codex-lb providers declared in models.yml.",
+    "description": "Registers a codex-lb provider that streams OpenAI Responses over codex-lb's WebSocket; configured via env (CODEX_LB_API_KEY / CODEX_LB_BASE_URL).",
     "extensions": ["src/index.ts"]
   },
+  "scripts": {
+    "test": "bun test"
+  },
   "dependencies": {
-    "@oh-my-pi/pi-ai": "^15.12.3",
-    "@oh-my-pi/pi-utils": "^15.12.3",
-    "yaml": "^2.8.1"
+    "@oh-my-pi/pi-ai": "^16.1.19",
+    "@oh-my-pi/pi-catalog": "^16.1.19"
   },
   "keywords": [
     "omp",
     "oh-my-pi",
     "codex",
     "codex-lb",
-    "websocket"
+    "websocket",
+    "responses"
   ]
 }
