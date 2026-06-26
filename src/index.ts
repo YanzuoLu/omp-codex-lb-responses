@@ -40,8 +40,8 @@ type ModelEntry = {
 };
 
 export type WebSearchMode = "off" | "inject" | "card";
-/** `codex-lb`: run the local HTTP→WS bridge so models.yml's codex-lb works. `off`: do nothing (native). */
-export type PluginMode = "codex-lb" | "off";
+/** `on`: run the local HTTP→WS bridge so models.yml's codex-lb works. `off`: do nothing (native). */
+export type PluginMode = "on" | "off";
 
 const DEFAULT_BRIDGE_PORT = 8787;
 
@@ -138,8 +138,8 @@ export function readConfig(settings: Settings = {}, env: Record<string, string |
 				? "card"
 				: "off";
 	const searchModel = pickString(settings, "searchModel", env, "CODEX_LB_WEB_SEARCH_MODEL") ?? models[0]?.id ?? "gpt-5.5";
-	const modeRaw = (pickString(settings, "mode", env, "CODEX_LB_MODE") ?? "codex-lb").toLowerCase();
-	const mode: PluginMode = modeRaw === "off" || modeRaw === "native" || modeRaw === "false" ? "off" : "codex-lb";
+	const modeRaw = (pickString(settings, "mode", env, "CODEX_LB_MODE") ?? "on").toLowerCase();
+	const mode: PluginMode = modeRaw === "off" || modeRaw === "native" || modeRaw === "false" ? "off" : "on";
 	const portRaw = pickString(settings, "bridgePort", env, "CODEX_LB_BRIDGE_PORT");
 	const portNum = portRaw ? Number(portRaw) : NaN;
 	const bridgePort = Number.isInteger(portNum) && portNum > 0 && portNum < 65536 ? portNum : DEFAULT_BRIDGE_PORT;
@@ -282,7 +282,7 @@ export function activate(pi: ExtensionApi, deps: ActivateDeps = {}): WebSocketFe
 	}
 	if (config.mode === "off") {
 		pi.logger?.info?.(
-			`${SERVICE}: mode=off — local bridge not started; codex-lb/* will not connect (use a native model). Set \`mode codex-lb\` to re-enable.`,
+			`${SERVICE}: mode=off — local bridge not started; codex-lb/* will not connect (use a native model). Set \`mode on\` to re-enable.`,
 		);
 		return undefined;
 	}

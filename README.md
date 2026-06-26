@@ -12,7 +12,7 @@ bridge** the plugin runs: omp talks ordinary `openai-responses` HTTP to
 `127.0.0.1`, and the bridge upgrades each request to codex-lb's WebSocket. Because
 models.yml is read **at startup** (before extension providers register),
 `codex-lb/<model>` resolves as the default — something a plugin-registered provider
-can't do. Toggle with `omp plugin config set omp-codex-lb-responses mode codex-lb|off`.
+can't do. Toggle with `omp plugin config set omp-codex-lb-responses mode on|off`.
 
 > **0.20 is a re-architecture.** ≤ 0.19 registered a standalone `codex-lb` provider
 > whose `streamSimple` opened the WebSocket. That worked, but omp resolves
@@ -38,10 +38,10 @@ provider-scoped `fetch`. Nothing global is patched.
 ## Install
 
 ```bash
-omp plugin install github:YanzuoLu/omp-codex-lb-responses#v0.20.0
+omp plugin install github:YanzuoLu/omp-codex-lb-responses#v0.21.0
 ```
 
-Pin a **version tag** (`#v0.20.0`), not a commit SHA, so upgrades are a one-line
+Pin a **version tag** (`#v0.21.0`), not a commit SHA, so upgrades are a one-line
 bump. There is **no patcher step** and nothing to re-apply after `omp update`.
 
 ## Configure
@@ -55,15 +55,15 @@ at startup).
 ```bash
 omp plugin config set omp-codex-lb-responses baseUrl https://your-codex-lb-host/v1
 omp plugin config set omp-codex-lb-responses apiKey  sk-clb-…
-omp plugin config set omp-codex-lb-responses mode    codex-lb   # or `off`
+omp plugin config set omp-codex-lb-responses mode    on   # or `off`
 ```
 
 | Setting | Required | Default | Env fallback | Meaning |
 |---------|----------|---------|--------------|---------|
-| `mode` | no | `codex-lb` | `CODEX_LB_MODE` | `codex-lb` = run the bridge; `off` = do nothing (use native models). Restart omp after changing. |
+| `mode` | no | `on` | `CODEX_LB_MODE` | `on` = run the bridge; `off` = do nothing (use native models). Restart omp after changing. |
 | `baseUrl` | **yes** | — | `CODEX_LB_BASE_URL` | Your codex-lb `/v1` endpoint. The bridge opens `wss://…/responses` derived from it. |
 | `apiKey` | **yes** | — | `CODEX_LB_API_KEY` | codex-lb key (`sk-clb-…`), sent by the bridge as a plain `Authorization: Bearer`. |
-| `bridgePort` | no | `8787` | `CODEX_LB_BRIDGE_PORT` | Local port the bridge listens on. Must match the `baseUrl` port in your models.yml. |
+| `bridgePort` | no | `8787` | `CODEX_LB_BRIDGE_PORT` | Local port the shared bridge listens on. Must match the `baseUrl` port in your models.yml. All omp instances share one bridge here (first to bind owns it; others stand by and auto-take-over if it exits). |
 | `models` | no | built-in catalog | `CODEX_LB_MODELS` | Comma-separated model ids served by the bridge's `/models`. |
 | `webSearch` | no | off | `CODEX_LB_WEB_SEARCH` | `card` = native-identical codex web search with the full Search card (see [Web search](#web-search)); `inject` = hosted tool per turn, no card. |
 | `searchModel` | no | first model | `CODEX_LB_WEB_SEARCH_MODEL` | Model used for `webSearch: card` search requests (e.g. `gpt-5.5`). |
@@ -111,7 +111,9 @@ omp -p --model codex-lb/gpt-5.5 "…"    # headless
 ```
 
 To go back to native models, `omp plugin config set omp-codex-lb-responses mode off`
-and restart (then pick a native model with `/model`).
+and restart (then pick a native model with `/model`). You can also just `/model
+openai-codex/gpt-5.5` at any time while the bridge is on — only `codex-lb/*` turns
+go through the bridge, native models are untouched.
 
 Or pick `codex-lb/<model>` in the model picker. The default catalog is `gpt-5.5`,
 `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark` (reasoning models).
@@ -165,6 +167,14 @@ For hosted-tool search without the card, use `webSearch: inject` instead.
   off omp's `prompt_cache_key` (carried in the request body), plus a `session-id`
   header on the socket. Subsequent turns in the same conversation reuse the same
   socket.
+- **One shared bridge, with automatic failover**: omp always sends `codex-lb` to the
+  single port models.yml declares, so every running omp instance shares one bridge —
+  the first to bind the port owns it, the rest stand by. Conversations stay isolated
+  regardless (the pool keys each to its own socket/account). If the owner exits, a
+  standby's unref'd retry timer re-binds the port within a few seconds and takes
+  over, so other instances never lose codex-lb. (omp resolves a session's model URL
+  at startup from models.yml and a runtime `registerProvider` override can't change
+  it, so a per-instance dynamic port is not possible — hence the shared bridge.)
 - **Fail-closed & resilient**: codex-lb degraded states (e.g. `429
   account_stream_cap`, "No available accounts") surface as a real error instead of
   a silent empty turn. A socket that dies before a terminal event yields a

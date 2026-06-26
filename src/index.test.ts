@@ -48,6 +48,14 @@ describe("readConfig", () => {
 		expect(c2.searchModel).toBe("gpt-5.4");
 	});
 
+	test("mode defaults to on, parses off, and accepts the codex-lb alias", () => {
+		expect(readConfig({ apiKey: "k", baseUrl: BASE })!.mode).toBe("on");
+		expect(readConfig({ apiKey: "k", baseUrl: BASE, mode: "off" })!.mode).toBe("off");
+		expect(readConfig({ apiKey: "k", baseUrl: BASE, mode: "on" })!.mode).toBe("on");
+		expect(readConfig({ apiKey: "k", baseUrl: BASE, mode: "native" })!.mode).toBe("off");
+		expect(readConfig({ apiKey: "k", baseUrl: BASE, mode: "codex-lb" })!.mode).toBe("on"); // backward-compat alias
+	});
+
 	test("default models are reasoning models with sane limits", () => {
 		const models = defaultModels();
 		expect(models.every((m) => m.reasoning)).toBe(true);

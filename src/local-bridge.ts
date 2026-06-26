@@ -36,6 +36,9 @@ export interface LocalBridgeOptions {
 		unref?: () => void;
 		port?: number;
 	};
+	/** Injectable timers (default globalThis.setInterval/clearInterval) — for tests + unref control. */
+	setIntervalImpl?: (cb: () => void, ms: number) => unknown;
+	clearIntervalImpl?: (handle: unknown) => void;
 }
 
 export interface LocalBridgeHandle {
@@ -96,11 +99,20 @@ export function createBridgeHandler(opts: LocalBridgeOptions): (req: Request) =>
 	};
 }
 
+/** How often a standby instance retries binding the shared port to take over if the owner exits. */
+export const REBIND_INTERVAL_MS = 3000;
+
 /**
- * Starts the local bridge. Returns undefined if Bun.serve is unavailable. On
- * EADDRINUSE (another omp instance already owns the bridge on this port) it reuses
- * that bridge rather than failing — localhost requests are session-keyed, so a
- * shared bridge serves every instance correctly.
+ * Starts the local bridge. All omp instances must talk to codex-lb at the single
+ * port models.yml declares, so they share one bridge: the first to bind owns it,
+ * the rest stand by. Returns undefined only if Bun.serve is unavailable or the bind
+ * fails fatally (not EADDRINUSE).
+ *
+ * Automatic failover: a standby instance runs an unref'd timer that retries the
+ * bind every `REBIND_INTERVAL_MS`. When the owner exits and frees the port, the
+ * next standby's tick takes over — so survivors never lose codex-lb just because
+ * the instance that happened to own the bridge quit first. Per-conversation account
+ * stickiness is unaffected: the pool keys each conversation to its own WebSocket.
  */
 export function startLocalBridge(opts: LocalBridgeOptions): LocalBridgeHandle | undefined {
 	const serve = opts.serve ?? (globalThis as unknown as { Bun?: { serve?: LocalBridgeOptions["serve"] } }).Bun?.serve;
@@ -109,27 +121,68 @@ export function startLocalBridge(opts: LocalBridgeOptions): LocalBridgeHandle | 
 		return undefined;
 	}
 	const handler = createBridgeHandler(opts);
-	let server: ReturnType<NonNullable<LocalBridgeOptions["serve"]>>;
-	try {
-		server = serve({ port: opts.port, hostname: "127.0.0.1", idleTimeout: 240, fetch: handler });
-	} catch (error) {
-		const msg = String((error as { message?: string })?.message ?? error);
-		if ((error as { code?: string })?.code === "EADDRINUSE" || /in use|address already/i.test(msg)) {
-			opts.logger?.info?.(`omp-codex-lb-responses: bridge port ${opts.port} already in use; reusing the existing bridge`);
-			return { port: opts.port, close() {} };
-		}
-		opts.logger?.warn?.(`omp-codex-lb-responses: failed to start local bridge: ${msg}`);
-		return undefined;
-	}
-	try {
-		server.unref?.();
-	} catch {}
-	opts.logger?.info?.(`omp-codex-lb-responses: local HTTP→WS bridge on http://127.0.0.1:${opts.port} → ${opts.baseUrl}`);
-	return {
-		port: opts.port,
-		close() {
+	const port = opts.port;
+	let server: ReturnType<NonNullable<LocalBridgeOptions["serve"]>> | undefined;
+	let rebindTimer: unknown;
+
+	// "bound" = we own the port now; "inuse" = another omp owns it (retry later);
+	// "error" = fatal, nothing to take over.
+	const attemptBind = (): "bound" | "inuse" | "error" => {
+		try {
+			const s = serve({ port, hostname: "127.0.0.1", idleTimeout: 240, fetch: handler });
 			try {
-				server.stop?.(true);
+				s.unref?.();
+			} catch {}
+			server = s;
+			return "bound";
+		} catch (error) {
+			const msg = String((error as { message?: string })?.message ?? error);
+			if ((error as { code?: string })?.code === "EADDRINUSE" || /in use|address already/i.test(msg)) return "inuse";
+			opts.logger?.warn?.(`omp-codex-lb-responses: failed to start local bridge: ${msg}`);
+			return "error";
+		}
+	};
+
+	const clearTimer = (): void => {
+		if (rebindTimer === undefined) return;
+		const clearImpl =
+			opts.clearIntervalImpl ?? (globalThis as unknown as { clearInterval?: (h: unknown) => void }).clearInterval;
+		try {
+			clearImpl?.(rebindTimer);
+		} catch {}
+		rebindTimer = undefined;
+	};
+
+	const first = attemptBind();
+	if (first === "error") return undefined;
+	if (first === "bound") {
+		opts.logger?.info?.(`omp-codex-lb-responses: local HTTP→WS bridge on http://127.0.0.1:${port} → ${opts.baseUrl}`);
+	} else {
+		// Another omp owns the port. Stand by and watch for it to free up.
+		opts.logger?.info?.(
+			`omp-codex-lb-responses: port ${port} owned by another omp; standing by to take over the bridge if it exits`,
+		);
+		const setIntervalImpl =
+			opts.setIntervalImpl ??
+			(globalThis as unknown as { setInterval?: (cb: () => void, ms: number) => unknown }).setInterval;
+		rebindTimer = setIntervalImpl?.(() => {
+			if (server) return;
+			if (attemptBind() === "bound") {
+				opts.logger?.info?.(`omp-codex-lb-responses: took over the bridge on http://127.0.0.1:${port} → ${opts.baseUrl}`);
+				clearTimer();
+			}
+		}, REBIND_INTERVAL_MS);
+		try {
+			(rebindTimer as { unref?: () => void } | undefined)?.unref?.();
+		} catch {}
+	}
+
+	return {
+		port,
+		close() {
+			clearTimer();
+			try {
+				server?.stop?.(true);
 			} catch {}
 		},
 	};

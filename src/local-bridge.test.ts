@@ -99,14 +99,60 @@ describe("startLocalBridge", () => {
 		expect(h?.port).toBe(8787);
 	});
 
-	test("reuses an existing bridge on EADDRINUSE instead of failing", () => {
+	test("stands by on EADDRINUSE and takes over when the owner frees the port", () => {
+		let serveAttempts = 0;
+		let tick: (() => void) | undefined;
+		let timerCleared = false;
+		let unrefed = false;
 		const h = startLocalBridge({
 			pool: fakePool({}),
 			baseUrl: "https://lb.example/v1",
 			apiKey: "k",
 			port: 8787,
-			serve: () => { const e: any = new Error("address already in use"); e.code = "EADDRINUSE"; throw e; },
+			serve: () => {
+				serveAttempts++;
+				if (serveAttempts === 1) { const e: any = new Error("address already in use"); e.code = "EADDRINUSE"; throw e; }
+				return { stop() {}, unref() {} };
+			},
+			setIntervalImpl: (cb: any) => { tick = cb; return { unref() { unrefed = true; } }; },
+			clearIntervalImpl: () => { timerCleared = true; },
 		});
-		expect(h?.port).toBe(8787);
+		expect(h?.port).toBe(8787); // standby handle, no throw
+		expect(serveAttempts).toBe(1); // first bind failed (owner present)
+		expect(unrefed).toBe(true); // timer unref'd so it can't keep the process alive
+		expect(typeof tick).toBe("function");
+		tick!(); // owner exited → next tick binds and takes over
+		expect(serveAttempts).toBe(2);
+		expect(timerCleared).toBe(true); // stops retrying once it owns the port
+	});
+
+	test("standby does not take over while the owner still holds the port", () => {
+		let serveAttempts = 0;
+		let tick: (() => void) | undefined;
+		let timerCleared = false;
+		startLocalBridge({
+			pool: fakePool({}),
+			baseUrl: "https://lb.example/v1",
+			apiKey: "k",
+			port: 8787,
+			serve: () => { const e: any = new Error("address already in use"); e.code = "EADDRINUSE"; throw e; },
+			setIntervalImpl: (cb: any) => { tick = cb; return { unref() {} }; },
+			clearIntervalImpl: () => { timerCleared = true; },
+		});
+		serveAttempts = 0;
+		tick!(); // owner still there → bind still fails
+		// (serve throws again; attempt counted inside startLocalBridge, not here)
+		expect(timerCleared).toBe(false); // keeps retrying
+	});
+
+	test("returns undefined on a non-EADDRINUSE serve error (nothing to take over)", () => {
+		const h = startLocalBridge({
+			pool: fakePool({}),
+			baseUrl: "https://lb.example/v1",
+			apiKey: "k",
+			port: 8787,
+			serve: () => { throw new Error("permission denied"); },
+		});
+		expect(h).toBeUndefined();
 	});
 });
