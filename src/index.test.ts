@@ -58,51 +58,68 @@ describe("readConfig", () => {
 });
 
 describe("activate", () => {
-	test("registers no provider and returns undefined when unconfigured", () => {
+	const fakeBridge = (calls: any[]) => (opts: any) => {
+		calls.push(opts);
+		return { port: opts.port, close() {} };
+	};
+
+	test("starts no bridge and returns undefined when unconfigured", () => {
+		const bridges: any[] = [];
 		let registered = 0;
-		const pool = activate({ registerProvider: () => registered++ }, { env: {} });
+		const pool = activate({ registerProvider: () => registered++ }, { env: {}, startBridge: fakeBridge(bridges) });
 		expect(registered).toBe(0);
+		expect(bridges.length).toBe(0);
 		expect(pool).toBeUndefined();
 	});
 
-	test("registers a codex-lb provider with custom api + streamSimple + models", () => {
-		const providers: Record<string, any> = {};
+	test("starts the local bridge (NO standalone provider) when configured", () => {
+		const bridges: any[] = [];
 		let label: string | undefined;
+		let registered = 0;
 		const pool = activate(
-			{ setLabel: (l) => (label = l), registerProvider: (n, c) => (providers[n] = c) },
-			{ env: { CODEX_LB_API_KEY: "k", CODEX_LB_BASE_URL: BASE }, WebSocketImpl: class {} },
+			{ setLabel: (l) => (label = l), registerProvider: () => registered++ },
+			{ env: { CODEX_LB_API_KEY: "k", CODEX_LB_BASE_URL: BASE }, WebSocketImpl: class {}, startBridge: fakeBridge(bridges) },
 		);
 		expect(label).toBe("Codex LB Responses");
-		const cfg = providers["codex-lb"];
-		expect(cfg).toBeDefined();
-		expect(cfg.api).toBe("codex-lb-responses");
-		expect(cfg.baseUrl).toBe(BASE);
-		expect(cfg.apiKey).toBe("k");
-		expect(typeof cfg.streamSimple).toBe("function");
-		expect(cfg.models.length).toBeGreaterThan(0);
-		expect(cfg.models[0].api).toBe("codex-lb-responses");
+		expect(registered).toBe(0); // Option B: the bridge replaces the standalone provider
+		expect(bridges).toHaveLength(1);
+		expect(bridges[0].baseUrl).toBe(BASE);
+		expect(bridges[0].apiKey).toBe("k");
+		expect(bridges[0].port).toBe(8787);
+		expect(bridges[0].models.length).toBeGreaterThan(0);
+		expect(typeof bridges[0].onSession).toBe("function");
+		expect(pool).toBeDefined();
 		pool?.close();
 	});
 
 	test("activates from plugin settings (no env)", () => {
-		const providers: Record<string, any> = {};
+		const bridges: any[] = [];
 		const pool = activate(
-			{ registerProvider: (n, c) => (providers[n] = c) },
-			{ settings: { apiKey: "k", baseUrl: BASE }, env: {}, WebSocketImpl: class {} },
+			{ registerProvider: () => {} },
+			{ settings: { apiKey: "k", baseUrl: BASE }, env: {}, WebSocketImpl: class {}, startBridge: fakeBridge(bridges) },
 		);
-		expect(providers["codex-lb"]).toBeDefined();
-		expect(providers["codex-lb"].baseUrl).toBe(BASE);
+		expect(bridges).toHaveLength(1);
+		expect(bridges[0].baseUrl).toBe(BASE);
 		pool?.close();
 	});
 
-	test("honors a custom provider id", () => {
-		const providers: Record<string, any> = {};
+	test("mode=off starts no bridge and returns undefined", () => {
+		const bridges: any[] = [];
 		const pool = activate(
-			{ registerProvider: (n, c) => (providers[n] = c) },
-			{ env: { CODEX_LB_API_KEY: "k", CODEX_LB_BASE_URL: BASE, CODEX_LB_PROVIDER_ID: "my-lb" }, WebSocketImpl: class {} },
+			{ registerProvider: () => {} },
+			{ env: { CODEX_LB_API_KEY: "k", CODEX_LB_BASE_URL: BASE, CODEX_LB_MODE: "off" }, startBridge: fakeBridge(bridges) },
 		);
-		expect(providers["my-lb"]).toBeDefined();
-		expect(providers["codex-lb"]).toBeUndefined();
+		expect(bridges.length).toBe(0);
+		expect(pool).toBeUndefined();
+	});
+
+	test("honors a custom bridge port", () => {
+		const bridges: any[] = [];
+		const pool = activate(
+			{ registerProvider: () => {} },
+			{ env: { CODEX_LB_API_KEY: "k", CODEX_LB_BASE_URL: BASE, CODEX_LB_BRIDGE_PORT: "9123" }, WebSocketImpl: class {}, startBridge: fakeBridge(bridges) },
+		);
+		expect(bridges[0].port).toBe(9123);
 		pool?.close();
 	});
 });

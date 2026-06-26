@@ -11,9 +11,10 @@
 // environment: CODEX_LB_API_KEY (required) + CODEX_LB_BASE_URL (optional). Switch
 // to it by selecting `codex-lb/<model>` in the model picker.
 
-import { AssistantMessageEventStream, streamOpenAIResponses } from "@oh-my-pi/pi-ai";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import type { Context, Model } from "@oh-my-pi/pi-ai";
 import { buildOpenAIResponsesCompat } from "@oh-my-pi/pi-catalog";
+import { startLocalBridge, type LocalBridgeHandle } from "./local-bridge";
 import { createWebSocketFetch, type FetchLike, type WebSocketFetch } from "./ws-pool";
 
 const SERVICE = "omp-codex-lb-responses";
@@ -39,6 +40,10 @@ type ModelEntry = {
 };
 
 export type WebSearchMode = "off" | "inject" | "card";
+/** `codex-lb`: run the local HTTP→WS bridge so models.yml's codex-lb works. `off`: do nothing (native). */
+export type PluginMode = "codex-lb" | "off";
+
+const DEFAULT_BRIDGE_PORT = 8787;
 
 export interface CodexLbConfig {
 	providerID: string;
@@ -47,6 +52,8 @@ export interface CodexLbConfig {
 	models: ModelEntry[];
 	webSearch: WebSearchMode;
 	searchModel: string;
+	mode: PluginMode;
+	bridgePort: number;
 }
 
 type ProviderConfig = {
@@ -131,7 +138,12 @@ export function readConfig(settings: Settings = {}, env: Record<string, string |
 				? "card"
 				: "off";
 	const searchModel = pickString(settings, "searchModel", env, "CODEX_LB_WEB_SEARCH_MODEL") ?? models[0]?.id ?? "gpt-5.5";
-	return { providerID, baseUrl, apiKey, models, webSearch, searchModel };
+	const modeRaw = (pickString(settings, "mode", env, "CODEX_LB_MODE") ?? "codex-lb").toLowerCase();
+	const mode: PluginMode = modeRaw === "off" || modeRaw === "native" || modeRaw === "false" ? "off" : "codex-lb";
+	const portRaw = pickString(settings, "bridgePort", env, "CODEX_LB_BRIDGE_PORT");
+	const portNum = portRaw ? Number(portRaw) : NaN;
+	const bridgePort = Number.isInteger(portNum) && portNum > 0 && portNum < 65536 ? portNum : DEFAULT_BRIDGE_PORT;
+	return { providerID, baseUrl, apiKey, models, webSearch, searchModel, mode, bridgePort };
 }
 
 /**
@@ -241,6 +253,8 @@ export interface ActivateDeps {
 	AssistantMessageEventStream?: EventStreamCtor;
 	WebSocketImpl?: unknown;
 	createPool?: typeof createWebSocketFetch;
+	/** Injectable local-bridge starter (for tests). */
+	startBridge?: typeof startLocalBridge;
 	/** Registrar for the `card`-mode web_search tool, imported lazily by the default export. */
 	webSearchRegistrar?: (pi: ExtensionApi, config: WebSearchToolConfig, runtime: WebSearchRuntime) => void;
 }
@@ -266,17 +280,17 @@ export function activate(pi: ExtensionApi, deps: ActivateDeps = {}): WebSocketFe
 		);
 		return undefined;
 	}
+	if (config.mode === "off") {
+		pi.logger?.info?.(
+			`${SERVICE}: mode=off — local bridge not started; codex-lb/* will not connect (use a native model). Set \`mode codex-lb\` to re-enable.`,
+		);
+		return undefined;
+	}
 	const createPool = deps.createPool ?? createWebSocketFetch;
 	const pool = createPool({ injectWebSearch: config.webSearch === "inject", WebSocketImpl: deps.WebSocketImpl });
-	const innerStream = deps.innerStream ?? (streamOpenAIResponses as unknown as InnerStream);
-	const StreamCtor = deps.AssistantMessageEventStream ?? (AssistantMessageEventStream as unknown as EventStreamCtor);
 
-	// Track which sessions are codex-lb turns. The web_search tool OVERRIDES omp's
-	// built-in tool globally, so it must tell a codex-lb turn from another provider's
-	// turn (e.g. omp falling back to the built-in openai-codex) — otherwise it would
-	// hijack an openai-codex search and force it onto codex-lb. Only OUR streamSimple
-	// runs for codex-lb turns, so a session it has seen IS codex-lb; anything else is
-	// delegated to native search.
+	// Track codex-lb sessions (fed by the bridge) so the web_search tool can reuse the
+	// conversation's socket and tell codex-lb turns from another provider's turns.
 	const codexLbSessions = new Map<string, number>();
 	let lastCodexLbSessionId: string | undefined;
 	let lastCodexLbTurnAt = 0;
@@ -288,12 +302,20 @@ export function activate(pi: ExtensionApi, deps: ActivateDeps = {}): WebSocketFe
 		if (codexLbSessions.size > 64) for (const [k, t] of codexLbSessions) if (now - t > 3_600_000) codexLbSessions.delete(k);
 	};
 
-	pi.registerProvider(config.providerID, {
-		api: CUSTOM_API,
+	// codex-lb resolves at startup ONLY via ~/.omp/agent/models.yml (read before
+	// extensions register), which forces api=openai-responses/HTTP — but codex-lb
+	// only speaks WebSocket. So run a local HTTP→WS bridge that models.yml's baseUrl
+	// points at: omp talks plain openai-responses to 127.0.0.1, the bridge upgrades
+	// each /responses to codex-lb's WS via the same session-keyed pool.
+	const startBridge = deps.startBridge ?? startLocalBridge;
+	const bridge = startBridge({
+		pool,
 		baseUrl: config.baseUrl,
 		apiKey: config.apiKey,
-		streamSimple: makeStreamSimple(config, pool, innerStream, StreamCtor, undefined, noteCodexLbSession),
+		port: config.bridgePort,
 		models: config.models,
+		logger: pi.logger,
+		onSession: noteCodexLbSession,
 	});
 
 	// Drop a session's socket when omp ends it, if the host emits such an event.
@@ -303,7 +325,9 @@ export function activate(pi: ExtensionApi, deps: ActivateDeps = {}): WebSocketFe
 	});
 
 	pi.logger?.info?.(
-		`${SERVICE}: registered provider "${config.providerID}" (${config.models.length} models) over codex-lb WebSocket at ${config.baseUrl}`,
+		bridge
+			? `${SERVICE}: codex-lb via local bridge on http://127.0.0.1:${bridge.port}/v1 → ${config.baseUrl} (${config.models.length} models). Point ~/.omp/agent/models.yml codex-lb baseUrl at it.`
+			: `${SERVICE}: local bridge did not start; codex-lb/* will not connect.`,
 	);
 
 	// `card` web-search mode: register a codex-lb web_search tool that reproduces

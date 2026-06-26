@@ -1,22 +1,26 @@
 # omp-codex-lb-responses
 
-An [omp](https://github.com/badlogic/pi-mono) (oh-my-pi) plugin that adds a
-**`codex-lb` provider** which routes the OpenAI **Responses API over codex-lb's
-WebSocket transport**. One WebSocket per conversation keeps codex-lb pinned to a
-single upstream account for the whole turn-sequence — the session/account
-consistency the load balancer needs — so long turns stop dropping silently.
+An [omp](https://github.com/badlogic/pi-mono) (oh-my-pi) plugin that makes a
+**`codex-lb` model usable in omp — including as the startup default** — by
+streaming the OpenAI **Responses API over codex-lb's WebSocket transport**. One
+WebSocket per conversation keeps codex-lb pinned to a single upstream account (the
+session/account consistency the load balancer needs), so long turns stop dropping
+silently.
 
-You switch to it by selecting `codex-lb/<model>` (`--model codex-lb/gpt-5.5`, or
-the model picker). Your other providers are left untouched.
+You declare `codex-lb` in `~/.omp/agent/models.yml` pointing at a **local HTTP→WS
+bridge** the plugin runs: omp talks ordinary `openai-responses` HTTP to
+`127.0.0.1`, and the bridge upgrades each request to codex-lb's WebSocket. Because
+models.yml is read **at startup** (before extension providers register),
+`codex-lb/<model>` resolves as the default — something a plugin-registered provider
+can't do. Toggle with `omp plugin config set omp-codex-lb-responses mode codex-lb|off`.
 
-> **0.18 is a rewrite.** Earlier versions (≤ 0.17) reused omp's built-in
-> **codex** transport, which forced a synthetic ChatGPT JWT, a global
-> `fetch`/`WebSocket` monkeypatch, a `models.yml` provider declaration, and a
-> source **patcher** that had to be re-applied after every `omp update`. This
-> version drops all four: it registers against omp's plain **`openai-responses`**
-> path (a bare `Authorization: Bearer` key), injects a **provider-scoped `fetch`**
-> for the WebSocket bridge, and is configured entirely from the **environment**.
-> See [Migrating from 0.17.x](#migrating-from-017x).
+> **0.20 is a re-architecture.** ≤ 0.19 registered a standalone `codex-lb` provider
+> whose `streamSimple` opened the WebSocket. That worked, but omp resolves
+> `modelRoles.default` before extensions register, so codex-lb could never be the
+> startup default. 0.20 declares codex-lb in `models.yml` (resolves early) and runs
+> an in-process **local HTTP→WS bridge** instead of a standalone provider. The
+> WebSocket transport, account stickiness, and the native web-search card are
+> unchanged.
 
 Requires **omp ≥ 16.0**.
 
@@ -34,48 +38,80 @@ provider-scoped `fetch`. Nothing global is patched.
 ## Install
 
 ```bash
-omp plugin install github:YanzuoLu/omp-codex-lb-responses#v0.19.2
+omp plugin install github:YanzuoLu/omp-codex-lb-responses#v0.20.0
 ```
 
-Pin a **version tag** (`#v0.19.2`), not a commit SHA, so upgrades are a one-line
+Pin a **version tag** (`#v0.20.0`), not a commit SHA, so upgrades are a one-line
 bump. There is **no patcher step** and nothing to re-apply after `omp update`.
 
 ## Configure
 
-Configure with `omp plugin config` (stored per-plugin in
-`~/.omp/plugins/omp-plugins.lock.json`) — no `models.yml`, no `config.yml`:
+Two pieces: the **plugin config** (the bridge's codex-lb endpoint + key, and the
+on/off toggle) and a one-time **`models.yml`** entry (so omp knows about `codex-lb`
+at startup).
+
+**1. Plugin config** — the bridge's codex-lb endpoint + key:
 
 ```bash
 omp plugin config set omp-codex-lb-responses baseUrl https://your-codex-lb-host/v1
 omp plugin config set omp-codex-lb-responses apiKey  sk-clb-…
-omp plugin config list omp-codex-lb-responses           # review (apiKey is masked)
+omp plugin config set omp-codex-lb-responses mode    codex-lb   # or `off`
 ```
 
 | Setting | Required | Default | Env fallback | Meaning |
 |---------|----------|---------|--------------|---------|
-| `baseUrl` | **yes** | — | `CODEX_LB_BASE_URL` | Your codex-lb `/v1` endpoint. The plugin opens `wss://…/responses` derived from it. |
-| `apiKey` | **yes** | — | `CODEX_LB_API_KEY` | codex-lb key (`sk-clb-…`), sent as a plain `Authorization: Bearer` (stored masked). |
-| `providerId` | no | `codex-lb` | `CODEX_LB_PROVIDER_ID` | Provider id shown in the picker (`<id>/<model>`). |
-| `models` | no | built-in catalog | `CODEX_LB_MODELS` | Comma-separated model ids to register instead of the defaults. |
+| `mode` | no | `codex-lb` | `CODEX_LB_MODE` | `codex-lb` = run the bridge; `off` = do nothing (use native models). Restart omp after changing. |
+| `baseUrl` | **yes** | — | `CODEX_LB_BASE_URL` | Your codex-lb `/v1` endpoint. The bridge opens `wss://…/responses` derived from it. |
+| `apiKey` | **yes** | — | `CODEX_LB_API_KEY` | codex-lb key (`sk-clb-…`), sent by the bridge as a plain `Authorization: Bearer`. |
+| `bridgePort` | no | `8787` | `CODEX_LB_BRIDGE_PORT` | Local port the bridge listens on. Must match the `baseUrl` port in your models.yml. |
+| `models` | no | built-in catalog | `CODEX_LB_MODELS` | Comma-separated model ids served by the bridge's `/models`. |
 | `webSearch` | no | off | `CODEX_LB_WEB_SEARCH` | `card` = native-identical codex web search with the full Search card (see [Web search](#web-search)); `inject` = hosted tool per turn, no card. |
 | `searchModel` | no | first model | `CODEX_LB_WEB_SEARCH_MODEL` | Model used for `webSearch: card` search requests (e.g. `gpt-5.5`). |
 
-`baseUrl` and `apiKey` are required — there is **no built-in default endpoint**
-baked into this package, so a codex-lb host is never committed here. Each setting
-also reads from its env var as a fallback (plugin config wins), so you can keep
-secrets in the environment instead:
+Each setting also reads from its env var (plugin config wins), so you can keep the
+secret out of the config file entirely:
 
 ```bash
 export CODEX_LB_API_KEY="sk-clb-…"
 export CODEX_LB_BASE_URL="https://your-codex-lb-host/v1"
 ```
 
+**2. `~/.omp/agent/models.yml`** — declare `codex-lb` pointing at the bridge (so it
+resolves at startup). Use `apiKey: CODEX_LB_API_KEY` (an env-var *name*, not the
+secret) and a `baseUrl` whose port matches `bridgePort`. A ready-to-copy file is in
+[`examples/models.yml`](examples/models.yml):
+
+```yaml
+providers:
+  codex-lb:
+    api: openai-responses
+    baseUrl: http://127.0.0.1:8787/v1
+    apiKey: CODEX_LB_API_KEY
+    models:
+      - { id: gpt-5.5, name: GPT-5.5, api: openai-responses, reasoning: true, input: [text, image], contextWindow: 272000, maxTokens: 128000, cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 } }
+      # gpt-5.4, gpt-5.4-mini, gpt-5.3-codex-spark likewise
+```
+
+**3. Make it the default (optional)** — set your default role in
+`~/.omp/agent/config.yml` so plain `omp` starts on codex-lb:
+
+```yaml
+modelRoles:
+  default: codex-lb/gpt-5.5:xhigh
+```
+
 ## Usage
+
+Plain `omp` starts on codex-lb when `modelRoles.default` is set (above). Otherwise
+select it explicitly:
 
 ```bash
 omp --model codex-lb/gpt-5.5            # interactive
 omp -p --model codex-lb/gpt-5.5 "…"    # headless
 ```
+
+To go back to native models, `omp plugin config set omp-codex-lb-responses mode off`
+and restart (then pick a native model with `/model`).
 
 Or pick `codex-lb/<model>` in the model picker. The default catalog is `gpt-5.5`,
 `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark` (reasoning models).
@@ -110,24 +146,24 @@ For hosted-tool search without the card, use `webSearch: inject` instead.
 
 ## How it works
 
-- **Provider registration** (`pi.registerProvider`): registers `codex-lb` with a
-  custom api id (`codex-lb-responses`) and a `streamSimple` wrapper. The models are
-  registered **programmatically** (inline), so no `models.yml` is needed — and
-  omp's YAML schema, which rejects custom api ids, is sidestepped.
-- **Plain-key Responses** (`streamSimple` → `streamOpenAIResponses`): each turn is
-  delegated to omp's built-in `openai-responses` path with a bare
-  `Authorization: Bearer <key>` (no ChatGPT JWT, no `chatgpt-account-id`). The
-  custom model has no catalog entry, so the plugin builds the standard
-  `openai-responses` `compat` itself (`buildOpenAIResponsesCompat`).
-- **WebSocket transport** (`src/ws-bridge.ts` + `src/ws-pool.ts`, the provider's
-  `fetch`): a streaming Responses POST to `/responses` is upgraded to a
-  `wss://…/responses` WebSocket. It sends `{ "type": "response.create", … }` and
-  translates the `response.*` frames back into the `data:`-framed SSE stream omp's
-  `readSseJson` decoder expects (terminated by `data: [DONE]`). codex-lb vendor
-  frames (`codex.rate_limits`, `codex.keepalive`) are filtered out.
+- **models.yml + local bridge** (`src/local-bridge.ts`): codex-lb is declared in
+  `~/.omp/agent/models.yml` as a plain `openai-responses` provider whose `baseUrl`
+  is `http://127.0.0.1:<bridgePort>/v1`. Because models.yml is read at startup
+  (before extensions), `codex-lb/<model>` resolves as the default — which a
+  plugin-registered provider can't. In `activate()` the plugin runs a `Bun.serve`
+  bridge on that port; it never calls `pi.registerProvider`.
+- **Plain-key Responses → WebSocket** (`src/ws-pool.ts` + `src/ws-bridge.ts`): omp
+  sends an ordinary `openai-responses` HTTP `POST …/responses` (bare
+  `Authorization: Bearer`, no ChatGPT JWT/account-id) to the bridge. The bridge
+  swaps in the codex-lb Bearer key and forwards through the session-keyed pool,
+  which upgrades the request to a `wss://…/responses` WebSocket: it sends
+  `{ "type": "response.create", … }` and translates the `response.*` frames back
+  into the `data:`-framed SSE omp's `readSseJson` decoder expects (terminated by
+  `data: [DONE]`). codex-lb vendor frames (`codex.rate_limits`, `codex.keepalive`)
+  are filtered out.
 - **Account stickiness** (session-keyed pool): one socket per conversation, keyed
-  by omp's `sessionId` (the id omp hands to `streamSimple`, plus a `session-id`
-  header on the socket). Subsequent turns in the same conversation reuse the same
+  off omp's `prompt_cache_key` (carried in the request body), plus a `session-id`
+  header on the socket. Subsequent turns in the same conversation reuse the same
   socket.
 - **Fail-closed & resilient**: codex-lb degraded states (e.g. `429
   account_stream_cap`, "No available accounts") surface as a real error instead of

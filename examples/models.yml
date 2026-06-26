@@ -1,0 +1,17 @@
+# Copy into ~/.omp/agent/models.yml (or merge the `codex-lb` provider into your
+# existing one). Declares codex-lb pointing at the plugin's local HTTP→WS bridge,
+# so `codex-lb/<model>` resolves at startup and can be your `modelRoles.default`.
+#
+# - `baseUrl` port (8787) must match the plugin's `bridgePort` setting.
+# - `apiKey` is an env-var NAME (CODEX_LB_API_KEY), not the secret itself.
+# - The real codex-lb endpoint + key live in the plugin config / env, not here.
+providers:
+  codex-lb:
+    api: openai-responses
+    baseUrl: http://127.0.0.1:8787/v1
+    apiKey: CODEX_LB_API_KEY
+    models:
+      - { id: gpt-5.5, name: GPT-5.5, api: openai-responses, reasoning: true, input: [text, image], contextWindow: 272000, maxTokens: 128000, cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 } }
+      - { id: gpt-5.4, name: GPT-5.4, api: openai-responses, reasoning: true, input: [text, image], contextWindow: 272000, maxTokens: 128000, cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 } }
+      - { id: gpt-5.4-mini, name: GPT-5.4-Mini, api: openai-responses, reasoning: true, input: [text, image], contextWindow: 272000, maxTokens: 128000, cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 } }
+      - { id: gpt-5.3-codex-spark, name: GPT-5.3-Codex-Spark, api: openai-responses, reasoning: true, input: [text], contextWindow: 128000, maxTokens: 128000, cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 } }

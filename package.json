@@ -1,6 +1,6 @@
 {
   "name": "omp-codex-lb-responses",
-  "version": "0.19.2",
+  "version": "0.20.0",
   "type": "module",
   "private": false,
   "description": "OMP plugin: a clean codex-lb provider that routes the OpenAI Responses API over codex-lb's WebSocket transport — no source patcher, no global monkeypatch, no synthetic JWT.",
@@ -11,9 +11,20 @@
   },
   "omp": {
     "name": "Codex LB Responses",
-    "description": "Registers a codex-lb provider that streams OpenAI Responses over codex-lb's WebSocket. Configure with `omp plugin config set omp-codex-lb-responses baseUrl <your codex-lb /v1 endpoint>` and `… apiKey <sk-clb-…>` (or the CODEX_LB_* env vars).",
+    "description": "Runs a local HTTP→WebSocket bridge so a `codex-lb` model declared in ~/.omp/agent/models.yml streams over codex-lb's WebSocket (and resolves as the startup default). Configure with `omp plugin config set omp-codex-lb-responses baseUrl <your codex-lb /v1 endpoint>` and `… apiKey <sk-clb-…>` (or the CODEX_LB_* env vars); toggle with `… mode codex-lb|off`.",
     "extensions": ["src/index.ts"],
     "settings": {
+      "mode": {
+        "type": "string",
+        "description": "'codex-lb' (default): run the local HTTP→WS bridge so codex-lb/* works and resolves at startup. 'off': do nothing (use native models). Restart omp after changing.",
+        "default": "codex-lb",
+        "env": "CODEX_LB_MODE"
+      },
+      "bridgePort": {
+        "type": "string",
+        "description": "Local port the HTTP→WS bridge listens on (127.0.0.1). Must match the baseUrl port in your models.yml codex-lb declaration. Default 8787.",
+        "env": "CODEX_LB_BRIDGE_PORT"
+      },
       "baseUrl": {
         "type": "string",
         "description": "Your codex-lb /v1 endpoint. The plugin opens wss://…/responses derived from it.",
