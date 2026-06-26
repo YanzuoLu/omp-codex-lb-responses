@@ -19,7 +19,7 @@ describe("readConfig", () => {
 		expect(c.baseUrl).toBe(BASE);
 		expect(c.providerID).toBe("clb");
 		expect(c.models.map((m) => m.id)).toEqual(["a", "b"]);
-		expect(c.injectWebSearch).toBe(true);
+		expect(c.webSearch).toBe("inject");
 	});
 
 	test("plugin settings take precedence over env, with env as fallback", () => {
@@ -36,7 +36,16 @@ describe("readConfig", () => {
 		expect(c.baseUrl).toBe("https://host/v1");
 		expect(c.providerID).toBe("codex-lb");
 		expect(c.models.map((m) => m.id)).toEqual(["a", "b"]);
-		expect(c.injectWebSearch).toBe(false);
+		expect(c.webSearch).toBe("off");
+	});
+
+	test("parses webSearch card mode + searchModel default", () => {
+		const c = readConfig({ apiKey: "k", baseUrl: BASE, webSearch: "card" })!;
+		expect(c.webSearch).toBe("card");
+		expect(c.searchModel).toBe("gpt-5.5"); // first default model
+		const c2 = readConfig({ apiKey: "k", baseUrl: BASE, webSearch: "tool", searchModel: "gpt-5.4" })!;
+		expect(c2.webSearch).toBe("card"); // "tool" is an alias for card
+		expect(c2.searchModel).toBe("gpt-5.4");
 	});
 
 	test("default models are reasoning models with sane limits", () => {

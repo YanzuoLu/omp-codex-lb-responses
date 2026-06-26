@@ -38,12 +38,15 @@ type ModelEntry = {
 	maxTokens: number;
 };
 
+export type WebSearchMode = "off" | "inject" | "card";
+
 export interface CodexLbConfig {
 	providerID: string;
 	baseUrl: string;
 	apiKey: string;
 	models: ModelEntry[];
-	injectWebSearch: boolean;
+	webSearch: WebSearchMode;
+	searchModel: string;
 }
 
 type ProviderConfig = {
@@ -118,11 +121,17 @@ export function readConfig(settings: Settings = {}, env: Record<string, string |
 	if (!apiKey || !baseUrlRaw) return undefined;
 	const baseUrl = baseUrlRaw.replace(/\/+$/, "");
 	const providerID = pickString(settings, "providerId", env, "CODEX_LB_PROVIDER_ID") ?? DEFAULT_PROVIDER_ID;
-	const webSearch = (pickString(settings, "webSearch", env, "CODEX_LB_WEB_SEARCH") ?? "").toLowerCase();
-	const injectWebSearch = webSearch === "inject" || webSearch === "true";
 	const ids = pickModelIds(settings, env);
 	const models = ids ? ids.map((id) => modelEntry(id)) : defaultModels();
-	return { providerID, baseUrl, apiKey, models, injectWebSearch };
+	const webSearchRaw = (pickString(settings, "webSearch", env, "CODEX_LB_WEB_SEARCH") ?? "").toLowerCase();
+	const webSearch: WebSearchMode =
+		webSearchRaw === "inject" || webSearchRaw === "true"
+			? "inject"
+			: webSearchRaw === "card" || webSearchRaw === "tool"
+				? "card"
+				: "off";
+	const searchModel = pickString(settings, "searchModel", env, "CODEX_LB_WEB_SEARCH_MODEL") ?? models[0]?.id ?? "gpt-5.5";
+	return { providerID, baseUrl, apiKey, models, webSearch, searchModel };
 }
 
 /**
@@ -212,6 +221,14 @@ export function makeStreamSimple(
 	};
 }
 
+export interface WebSearchToolConfig {
+	providerID: string;
+	baseUrl: string;
+	apiKey: string;
+	searchModel: string;
+	searchContextSize?: "low" | "medium" | "high";
+}
+
 export interface ActivateDeps {
 	settings?: Settings;
 	env?: Record<string, string | undefined>;
@@ -219,6 +236,8 @@ export interface ActivateDeps {
 	AssistantMessageEventStream?: EventStreamCtor;
 	WebSocketImpl?: unknown;
 	createPool?: typeof createWebSocketFetch;
+	/** Registrar for the `card`-mode web_search tool, imported lazily by the default export. */
+	webSearchRegistrar?: (pi: ExtensionApi, config: WebSearchToolConfig) => void;
 }
 
 export function activate(pi: ExtensionApi, deps: ActivateDeps = {}): WebSocketFetch | undefined {
@@ -231,7 +250,7 @@ export function activate(pi: ExtensionApi, deps: ActivateDeps = {}): WebSocketFe
 		return undefined;
 	}
 	const createPool = deps.createPool ?? createWebSocketFetch;
-	const pool = createPool({ injectWebSearch: config.injectWebSearch, WebSocketImpl: deps.WebSocketImpl });
+	const pool = createPool({ injectWebSearch: config.webSearch === "inject", WebSocketImpl: deps.WebSocketImpl });
 	const innerStream = deps.innerStream ?? (streamOpenAIResponses as unknown as InnerStream);
 	const StreamCtor = deps.AssistantMessageEventStream ?? (AssistantMessageEventStream as unknown as EventStreamCtor);
 
@@ -252,10 +271,38 @@ export function activate(pi: ExtensionApi, deps: ActivateDeps = {}): WebSocketFe
 	pi.logger?.info?.(
 		`${SERVICE}: registered provider "${config.providerID}" (${config.models.length} models) over codex-lb WebSocket at ${config.baseUrl}`,
 	);
+
+	// `card` web-search mode: register a codex-lb web_search tool that reproduces
+	// the native codex search request + card (registrar imported lazily upstream).
+	if (config.webSearch === "card" && deps.webSearchRegistrar) {
+		try {
+			deps.webSearchRegistrar(pi, {
+				providerID: config.providerID,
+				baseUrl: config.baseUrl,
+				apiKey: config.apiKey,
+				searchModel: config.searchModel,
+				searchContextSize: "high",
+			});
+		} catch (error) {
+			pi.logger?.warn?.(`${SERVICE}: failed to register codex-lb web_search tool: ${String(error)}`);
+		}
+	}
 	return pool;
 }
 
 export default async function codexLbResponses(pi: ExtensionApi): Promise<void> {
 	const settings = await loadPluginSettings();
-	activate(pi, { settings });
+	const config = readConfig(settings);
+	// In `card` mode, load the web_search tool registrar BEFORE activate so the
+	// (lazy, pi-coding-agent-dependent) import is awaited up front; activate then
+	// registers it alongside the provider.
+	let webSearchRegistrar: ActivateDeps["webSearchRegistrar"];
+	if (config && config.webSearch === "card") {
+		try {
+			webSearchRegistrar = (await import("./web-search")).registerCodexLbWebSearch as never;
+		} catch (error) {
+			pi.logger?.warn?.(`${SERVICE}: failed to import codex-lb web_search module: ${String(error)}`);
+		}
+	}
+	activate(pi, { settings, webSearchRegistrar });
 }

@@ -34,10 +34,10 @@ provider-scoped `fetch`. Nothing global is patched.
 ## Install
 
 ```bash
-omp plugin install github:YanzuoLu/omp-codex-lb-responses#v0.18.1
+omp plugin install github:YanzuoLu/omp-codex-lb-responses#v0.19.0
 ```
 
-Pin a **version tag** (`#v0.18.1`), not a commit SHA, so upgrades are a one-line
+Pin a **version tag** (`#v0.19.0`), not a commit SHA, so upgrades are a one-line
 bump. There is **no patcher step** and nothing to re-apply after `omp update`.
 
 ## Configure
@@ -57,7 +57,8 @@ omp plugin config list omp-codex-lb-responses           # review (apiKey is mask
 | `apiKey` | **yes** | — | `CODEX_LB_API_KEY` | codex-lb key (`sk-clb-…`), sent as a plain `Authorization: Bearer` (stored masked). |
 | `providerId` | no | `codex-lb` | `CODEX_LB_PROVIDER_ID` | Provider id shown in the picker (`<id>/<model>`). |
 | `models` | no | built-in catalog | `CODEX_LB_MODELS` | Comma-separated model ids to register instead of the defaults. |
-| `webSearch` | no | off | `CODEX_LB_WEB_SEARCH` | `inject` to add the hosted `web_search` tool to each turn (plugin-only, no patch; no native search-card UI). |
+| `webSearch` | no | off | `CODEX_LB_WEB_SEARCH` | `card` = native-identical codex web search with the full Search card (see [Web search](#web-search)); `inject` = hosted tool per turn, no card. |
+| `searchModel` | no | first model | `CODEX_LB_WEB_SEARCH_MODEL` | Model used for `webSearch: card` search requests (e.g. `gpt-5.5`). |
 
 `baseUrl` and `apiKey` are required — there is **no built-in default endpoint**
 baked into this package, so a codex-lb host is never committed here. Each setting
@@ -78,6 +79,30 @@ omp -p --model codex-lb/gpt-5.5 "…"    # headless
 
 Or pick `codex-lb/<model>` in the model picker. The default catalog is `gpt-5.5`,
 `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark` (reasoning models).
+
+## Web search
+
+```bash
+omp plugin config set omp-codex-lb-responses webSearch card
+```
+
+`webSearch: card` registers a `web_search` tool that **reproduces omp's native
+codex web search**, pointed at your codex-lb account — **no source patch, no
+global monkeypatch**:
+
+- The search request is **byte-identical** to omp's built-in codex search
+  (`stream`, `store:false`, the `web_search` tool with `search_context_size`,
+  `tool_choice`, and omp's own search system prompt); only the URL (→ codex-lb)
+  and auth (→ your `sk-clb-…` Bearer, no `chatgpt-account-id`) differ.
+- Results render through **omp's own exported Search card** (answer + clickable
+  sources), so the UI is the native one.
+- It **overrides omp's built-in `web_search`**: on codex-lb turns the search goes
+  to codex-lb; on other models it transparently delegates to omp's native search.
+  So when you're on a `codex-lb/<model>`, the official-ChatGPT codex search (which
+  you have no OAuth for) is effectively replaced by codex-lb's.
+
+`searchModel` picks the model for the search request (default: your first model).
+For hosted-tool search without the card, use `webSearch: inject` instead.
 
 ## How it works
 
@@ -105,11 +130,13 @@ Or pick `codex-lb/<model>` in the model picker. The default catalog is `gpt-5.5`
   a silent empty turn. A socket that dies before a terminal event yields a
   synthetic retryable error frame, so omp replays the turn (bounded), then falls
   back to plain HTTP after the WebSocket retry budget is exhausted.
-- **No globals patched, no source patched.** The fetch override is per-provider,
-  the auth is a plain key, and the two omp behaviors that *are* hardcoded to the
-  built-in `openai-codex` provider — remote compaction and the native web-search
-  card — are intentionally **not** used (web search is available in plugin-only
-  `inject` mode instead).
+- **Web search** (`webSearch: card`, `src/web-search.ts` + `src/web-search-core.ts`):
+  a plugin-registered `web_search` tool that replicates omp's native codex search
+  request to codex-lb and renders results through omp's own exported card renderer.
+  No source patch, no global monkeypatch. See [Web search](#web-search).
+- **No globals patched, no source patched.** The fetch override is per-provider and
+  the auth is a plain key. The one omp behavior still hardcoded to the built-in
+  `openai-codex` provider — remote compaction — is intentionally **not** used.
 
 ## Migrating from 0.17.x
 
@@ -120,11 +147,14 @@ Or pick `codex-lb/<model>` in the model picker. The default catalog is `gpt-5.5`
   longer read. Configure with `omp plugin config` (or the env vars) instead.
 - Reinstall the plugin at the new tag and set `baseUrl` + `apiKey` via
   `omp plugin config set omp-codex-lb-responses …` (see [Configure](#configure)).
-- **Lost vs 0.17:** omp's remote compaction (long conversations fall back to local
-  summarization) and the native web-search **card** (use `CODEX_LB_WEB_SEARCH=inject`
-  for hosted search without the card). Everything else — WebSocket transport,
-  account stickiness, encrypted reasoning, transient-failure resilience — is kept,
-  without the patcher/monkeypatch/JWT machinery.
+- **Web search is back, patch-free.** 0.17 needed the source patcher for the native
+  search card; 0.19's `webSearch: card` reproduces it as a plugin tool (see
+  [Web search](#web-search)) — set `omp plugin config set omp-codex-lb-responses
+  webSearch card`.
+- **Lost vs 0.17:** only omp's remote compaction (long conversations fall back to
+  local summarization). Everything else — WebSocket transport, account stickiness,
+  encrypted reasoning, transient-failure resilience, and now the native search card
+  — is kept, without the patcher/monkeypatch/JWT machinery.
 
 ## Development
 

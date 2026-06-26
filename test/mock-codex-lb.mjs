@@ -85,6 +85,57 @@ function* okFrames(body, text) {
 	};
 }
 
+// Main turn that asks the agent to call the web_search tool (function call).
+function* webSearchCallFrames(body, query) {
+	const rid = "resp_ws_1";
+	const fid = "fc_ws_1";
+	const cid = "call_ws_1";
+	const args = JSON.stringify({ query });
+	yield { type: "response.created", response: { id: rid, object: "response", status: "in_progress", model: body?.model ?? "gpt-5.5", output: [] } };
+	yield { type: "response.output_item.added", output_index: 0, sequence_number: 1, item: { id: fid, type: "function_call", status: "in_progress", call_id: cid, name: "web_search", arguments: "" } };
+	yield { type: "response.function_call_arguments.delta", item_id: fid, output_index: 0, sequence_number: 2, delta: args };
+	yield { type: "response.function_call_arguments.done", item_id: fid, output_index: 0, sequence_number: 3, arguments: args };
+	yield { type: "response.output_item.done", output_index: 0, sequence_number: 4, item: { id: fid, type: "function_call", status: "completed", call_id: cid, name: "web_search", arguments: args } };
+	yield { type: "response.completed", sequence_number: 5, response: { id: rid, object: "response", status: "completed", model: body?.model ?? "gpt-5.5", output: [{ id: fid, type: "function_call", status: "completed", call_id: cid, name: "web_search", arguments: args }], usage: { input_tokens: 12, output_tokens: 4, total_tokens: 16 } } };
+}
+
+// HTTP /responses web-search reply: answer text + url_citation sources.
+function* searchResultFrames(body) {
+	const rid = "resp_search_1";
+	const mid = "msg_search_1";
+	const answer = "Cats purr to communicate contentment and to self-soothe.";
+	const base = { id: rid, object: "response", status: "in_progress", model: body?.model ?? "gpt-5.5", output: [] };
+	yield { type: "response.created", response: { ...base } };
+	yield { type: "response.output_text.delta", item_id: mid, output_index: 0, content_index: 0, delta: answer };
+	yield {
+		type: "response.output_item.done",
+		output_index: 0,
+		item: {
+			id: mid,
+			type: "message",
+			status: "completed",
+			role: "assistant",
+			content: [
+				{
+					type: "output_text",
+					text: answer,
+					annotations: [
+						{ type: "url_citation", url: "https://example.org/cats-purr", title: "Why Cats Purr" },
+						{ type: "url_citation", url: "https://example.org/feline-behavior", title: "Feline Behavior" },
+					],
+				},
+			],
+		},
+	};
+	yield { type: "response.completed", response: { ...base, status: "completed", model: body?.model ?? "gpt-5.5", usage: { input_tokens: 50, output_tokens: 30, total_tokens: 80, input_tokens_details: { cached_tokens: 0 } } } };
+}
+
+function bodyHasWebSearch(body) {
+	const tools = Array.isArray(body?.tools) ? body.tools : [];
+	if (tools.some((t) => t && t.type === "web_search")) return true;
+	return body?.tool_choice && body.tool_choice.type === "web_search";
+}
+
 function errorFrame() {
 	return {
 		type: "error",
@@ -147,7 +198,9 @@ const server = Bun.serve({
 			}
 			if (body?.type !== "response.create") return;
 			responseCreates++;
-			console.error(`[mock] response.create #${responseCreates} model=${body.model} text=${JSON.stringify(userText(body)).slice(0, 60)}`);
+			ws.createCount = (ws.createCount ?? 0) + 1;
+			console.error(`[mock] response.create #${responseCreates} (socket turn ${ws.createCount}) model=${body.model} text=${JSON.stringify(userText(body)).slice(0, 60)}`);
+			console.error(`[mock] offered tools: ${JSON.stringify((Array.isArray(body.tools) ? body.tools : []).map((t) => (t.type === "function" ? `fn:${t.name}` : t.type)))}`);
 			if (mode === "hang") return;
 			if (mode === "error429") {
 				ws.send(JSON.stringify(errorFrame()));
@@ -156,6 +209,16 @@ const server = Bun.serve({
 			if (mode === "closeEarly") {
 				ws.send(JSON.stringify({ type: "response.created", response: { id: "resp_mock_1", object: "response", status: "in_progress" } }));
 				setTimeout(() => ws.close(), 20);
+				return;
+			}
+			if (mode === "websearch") {
+				// Turn 1: ask the agent to call web_search. Turn 2+: answer using the result.
+				if (ws.createCount === 1) {
+					console.error("[mock] -> emitting web_search tool call");
+					for (const frame of webSearchCallFrames(body, userText(body) || "why do cats purr")) ws.send(JSON.stringify(frame));
+				} else {
+					for (const frame of okFrames(body, "Final answer: cats purr to communicate (per web search).")) ws.send(JSON.stringify(frame));
+				}
 				return;
 			}
 			for (const frame of okFrames(body, reply)) ws.send(JSON.stringify(frame));
@@ -172,14 +235,20 @@ async function handleHttpResponses(req) {
 	try {
 		body = JSON.parse(raw);
 	} catch {}
-	console.error(`[mock] HTTP POST /responses model=${body.model}`);
+	const isSearch = bodyHasWebSearch(body);
+	console.error(`[mock] HTTP POST /responses model=${body.model} web_search=${isSearch}`);
+	if (isSearch) {
+		// Print the exact request so the harness can verify it matches native codex search.
+		console.error(`[mock] SEARCH REQUEST BODY: ${JSON.stringify(body)}`);
+	}
 	if (mode === "error429") {
 		return new Response(JSON.stringify(errorFrame()), { status: 429, headers: { "content-type": "application/json" } });
 	}
+	const frames = isSearch ? searchResultFrames(body) : okFrames(body, reply);
 	const stream = new ReadableStream({
 		start(controller) {
 			const enc = new TextEncoder();
-			for (const frame of okFrames(body, reply)) controller.enqueue(enc.encode(`data: ${JSON.stringify(frame)}\n\n`));
+			for (const frame of frames) controller.enqueue(enc.encode(`data: ${JSON.stringify(frame)}\n\n`));
 			controller.enqueue(enc.encode("data: [DONE]\n\n"));
 			controller.close();
 		},
