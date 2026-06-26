@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildSearchBody, buildSearchHeaders, codexLbSearch, formatForLLM, parseSearchStream, retryAsync } from "./web-search-core";
+import { buildSearchBody, buildSearchHeaders, codexLbSearch, formatForLLM, isCodexLbTurn, parseSearchStream, retryAsync } from "./web-search-core";
 
 const noSleep = (_ms: number) => Promise.resolve();
 
@@ -175,6 +175,30 @@ describe("retryAsync (absorbs codex-lb transient 1011s)", () => {
 			retryAsync(async () => { calls++; return "x"; }, { maxAttempts: 3, sleep: noSleep, signal: AbortSignal.abort() }),
 		).rejects.toThrow(/abort/i);
 		expect(calls).toBe(0);
+	});
+});
+
+describe("isCodexLbTurn (don't hijack non-codex-lb searches)", () => {
+	const codexLbSessions = new Set(["codexlb-sess"]);
+	const deps = { isCodexLbSession: (s: string) => codexLbSessions.has(s), recentlyCodexLb: () => false };
+
+	test("ctx.model.provider is authoritative: codex-lb → true", () => {
+		expect(isCodexLbTurn({ model: { provider: "codex-lb" } }, "codex-lb", deps)).toBe(true);
+	});
+	test("ctx.model.provider openai-codex → false (delegates to native)", () => {
+		expect(isCodexLbTurn({ model: { provider: "openai-codex" } }, "codex-lb", deps)).toBe(false);
+	});
+	test("no model, session is a known codex-lb session → true", () => {
+		expect(isCodexLbTurn({ sessionId: "codexlb-sess" }, "codex-lb", deps)).toBe(true);
+	});
+	test("no model, session is NOT a codex-lb session → false (the openai-codex bug)", () => {
+		expect(isCodexLbTurn({ sessionId: "openai-codex-sess" }, "codex-lb", deps)).toBe(false);
+	});
+	test("no model, no session, but a codex-lb turn just ran → true (covers -p)", () => {
+		expect(isCodexLbTurn({}, "codex-lb", { recentlyCodexLb: () => true })).toBe(true);
+	});
+	test("no model, no session, no recent codex-lb activity → false (safe default: native)", () => {
+		expect(isCodexLbTurn(undefined, "codex-lb", { recentlyCodexLb: () => false })).toBe(false);
 	});
 });
 

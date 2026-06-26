@@ -183,4 +183,20 @@ describe("makeStreamSimple", () => {
 		expect(innerArgs.options.apiKey).toBe("real-key"); // no per-turn key → config key
 		expect(bindCalls.sid).toBe("PCK");
 	});
+
+	test("reports the conversation session id via onSession so web_search reuses its socket", () => {
+		const pool = { bind: () => (async () => new Response(null)) as never, remove() {}, close() {} };
+		const fakeInner = () => {
+			const s = new AssistantMessageEventStream();
+			queueMicrotask(() => s.end({ api: "openai-responses" } as never));
+			return s;
+		};
+		const seen: string[] = [];
+		const streamSimple = makeStreamSimple(config, pool as never, fakeInner as never, AssistantMessageEventStream as never, () => ({}), (sid) => seen.push(sid));
+		streamSimple({ id: "gpt-5.5", provider: "codex-lb" } as never, {} as never, { sessionId: "CONV-1" });
+		expect(seen).toEqual(["CONV-1"]);
+		// A turn without any session id must not report (so the search keeps the last known one).
+		streamSimple({ id: "gpt-5.5", provider: "codex-lb" } as never, {} as never, {});
+		expect(seen).toEqual(["CONV-1"]);
+	});
 });

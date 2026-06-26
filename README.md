@@ -34,10 +34,10 @@ provider-scoped `fetch`. Nothing global is patched.
 ## Install
 
 ```bash
-omp plugin install github:YanzuoLu/omp-codex-lb-responses#v0.19.1
+omp plugin install github:YanzuoLu/omp-codex-lb-responses#v0.19.2
 ```
 
-Pin a **version tag** (`#v0.19.1`), not a commit SHA, so upgrades are a one-line
+Pin a **version tag** (`#v0.19.2`), not a commit SHA, so upgrades are a one-line
 bump. There is **no patcher step** and nothing to re-apply after `omp update`.
 
 ## Configure

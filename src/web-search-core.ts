@@ -383,6 +383,33 @@ export function hasRenderableSearchContent(response: SearchResponse): boolean {
 	return Boolean((response.answer && response.answer.length > 0) || response.sources.length > 0);
 }
 
+// ── provider routing for the global web_search override ───────────────────────
+
+export interface CodexLbTurnDeps {
+	/** True if `sessionId` belongs to a codex-lb turn (vs another provider's). */
+	isCodexLbSession?: (sessionId: string) => boolean;
+	/** True if a codex-lb turn ran very recently (fallback when no session/model in ctx). */
+	recentlyCodexLb?: () => boolean;
+}
+
+/**
+ * Decides whether THIS web_search turn is a codex-lb turn (→ codex-lb search) or
+ * another provider's (→ delegate to native). The tool OVERRIDES omp's built-in
+ * web_search globally, so getting this right is what stops it from hijacking, e.g.,
+ * an openai-codex search onto codex-lb (which happens when omp falls back to the
+ * built-in provider). Priority: ctx.model.provider (authoritative when present) →
+ * the session's known provider → "did a codex-lb turn just run" recency. Defaults
+ * to NOT codex-lb (the safe choice: native search), so a non-codex-lb turn is never
+ * forced onto codex-lb.
+ */
+export function isCodexLbTurn(ctx: { model?: { provider?: unknown }; sessionId?: unknown } | undefined, providerID: string, deps: CodexLbTurnDeps): boolean {
+	const provider = typeof ctx?.model?.provider === "string" ? ctx.model.provider : undefined;
+	if (provider) return provider === providerID;
+	const sid = typeof ctx?.sessionId === "string" && ctx.sessionId ? ctx.sessionId : undefined;
+	if (sid && deps.isCodexLbSession) return deps.isCodexLbSession(sid) || (deps.recentlyCodexLb?.() ?? false);
+	return deps.recentlyCodexLb?.() ?? false;
+}
+
 // ── transient-failure retry ───────────────────────────────────────────────────
 //
 // codex-lb's upstream returns transient 1011 "internal error" closes even for

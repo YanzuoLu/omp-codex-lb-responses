@@ -182,6 +182,7 @@ export function makeStreamSimple(
 	innerStream: InnerStream,
 	StreamCtor: EventStreamCtor,
 	buildCompat: BuildCompat = buildOpenAIResponsesCompat as unknown as BuildCompat,
+	onSession?: (sessionID: string) => void,
 ) {
 	return function streamCodexLb(model: Model, context: Context, options?: Record<string, unknown>): AssistantMessageEventStream {
 		const opts = (options ?? {}) as Record<string, unknown>;
@@ -189,6 +190,10 @@ export function makeStreamSimple(
 		const apiKey = typeof opts.apiKey === "string" && opts.apiKey ? (opts.apiKey as string) : config.apiKey;
 		const sessionID =
 			(typeof opts.sessionId === "string" && opts.sessionId) || (typeof opts.promptCacheKey === "string" && opts.promptCacheKey) || undefined;
+		// Remember the conversation's session so the web_search tool can REUSE its
+		// pooled socket instead of opening a second concurrent WS (codex-lb caps
+		// concurrent connections per account — a second upgrade gets rejected).
+		if (sessionID) onSession?.(sessionID);
 		const httpFetch = (typeof opts.fetch === "function" ? opts.fetch : globalThis.fetch) as FetchLike;
 		const wsFetch = pool.bind(sessionID || undefined, httpFetch);
 
@@ -244,6 +249,12 @@ export interface ActivateDeps {
 export interface WebSearchRuntime {
 	pool: WebSocketFetch;
 	baseFetch: FetchLike;
+	/** Returns the active conversation's session id, so the search can reuse its socket. */
+	getSessionId?: () => string | undefined;
+	/** True if `sessionId` belongs to a codex-lb turn (vs another provider's). */
+	isCodexLbSession?: (sessionId: string) => boolean;
+	/** True if a codex-lb turn ran very recently (fallback when no session/model in ctx). */
+	recentlyCodexLb?: () => boolean;
 }
 
 export function activate(pi: ExtensionApi, deps: ActivateDeps = {}): WebSocketFetch | undefined {
@@ -260,11 +271,28 @@ export function activate(pi: ExtensionApi, deps: ActivateDeps = {}): WebSocketFe
 	const innerStream = deps.innerStream ?? (streamOpenAIResponses as unknown as InnerStream);
 	const StreamCtor = deps.AssistantMessageEventStream ?? (AssistantMessageEventStream as unknown as EventStreamCtor);
 
+	// Track which sessions are codex-lb turns. The web_search tool OVERRIDES omp's
+	// built-in tool globally, so it must tell a codex-lb turn from another provider's
+	// turn (e.g. omp falling back to the built-in openai-codex) — otherwise it would
+	// hijack an openai-codex search and force it onto codex-lb. Only OUR streamSimple
+	// runs for codex-lb turns, so a session it has seen IS codex-lb; anything else is
+	// delegated to native search.
+	const codexLbSessions = new Map<string, number>();
+	let lastCodexLbSessionId: string | undefined;
+	let lastCodexLbTurnAt = 0;
+	const noteCodexLbSession = (sid: string): void => {
+		const now = Date.now();
+		codexLbSessions.set(sid, now);
+		lastCodexLbSessionId = sid;
+		lastCodexLbTurnAt = now;
+		if (codexLbSessions.size > 64) for (const [k, t] of codexLbSessions) if (now - t > 3_600_000) codexLbSessions.delete(k);
+	};
+
 	pi.registerProvider(config.providerID, {
 		api: CUSTOM_API,
 		baseUrl: config.baseUrl,
 		apiKey: config.apiKey,
-		streamSimple: makeStreamSimple(config, pool, innerStream, StreamCtor),
+		streamSimple: makeStreamSimple(config, pool, innerStream, StreamCtor, undefined, noteCodexLbSession),
 		models: config.models,
 	});
 
@@ -293,8 +321,17 @@ export function activate(pi: ExtensionApi, deps: ActivateDeps = {}): WebSocketFe
 				},
 				// codex-lb's HTTP /responses is non-functional; the search must ride the
 				// SAME WebSocket pool the provider uses. Reusing this pool also normalizes
-				// headers (lowercasing the beta header) so the WS upgrade succeeds.
-				{ pool, baseFetch: (globalThis.fetch as unknown) as FetchLike },
+				// headers (lowercasing the beta header) so the WS upgrade succeeds, and
+				// reusing the conversation's session avoids a second WS upgrade that
+				// codex-lb would reject. isCodexLbSession/recentlyCodexLb let the tool
+				// route codex-lb turns to codex-lb and delegate everything else to native.
+				{
+					pool,
+					baseFetch: (globalThis.fetch as unknown) as FetchLike,
+					getSessionId: () => lastCodexLbSessionId,
+					isCodexLbSession: (sid: string) => codexLbSessions.has(sid),
+					recentlyCodexLb: () => Date.now() - lastCodexLbTurnAt < 30_000,
+				},
 			);
 		} catch (error) {
 			pi.logger?.warn?.(`${SERVICE}: failed to register codex-lb web_search tool: ${String(error)}`);

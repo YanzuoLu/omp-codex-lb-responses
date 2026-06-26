@@ -24,7 +24,8 @@
 
 import { randomUUID } from "node:crypto";
 import { renderSearchCall, renderSearchResult } from "@oh-my-pi/pi-coding-agent/web/search/render";
-import { codexLbSearch, formatForLLM, hasRenderableSearchContent, retryAsync, type SearchResponse, WEB_SEARCH_SYSTEM_PROMPT, WEB_SEARCH_TOOL_DESCRIPTION } from "./web-search-core";
+import { getSearchTools } from "@oh-my-pi/pi-coding-agent/web/search/index";
+import { codexLbSearch, formatForLLM, hasRenderableSearchContent, isCodexLbTurn, retryAsync, type SearchResponse, WEB_SEARCH_SYSTEM_PROMPT, WEB_SEARCH_TOOL_DESCRIPTION } from "./web-search-core";
 import type { FetchLike, WebSocketFetch } from "./ws-pool";
 
 type Pi = {
@@ -45,7 +46,13 @@ export interface WebSearchToolConfig {
 export interface WebSearchRuntime {
 	pool: WebSocketFetch;
 	baseFetch: FetchLike;
-	/** Max codex-lb search attempts (fresh WS/session each) before giving up. Default 3. */
+	/** Returns the active conversation's session id so the search reuses its socket. */
+	getSessionId?: () => string | undefined;
+	/** True if `sessionId` belongs to a codex-lb turn (vs another provider's). */
+	isCodexLbSession?: (sessionId: string) => boolean;
+	/** True if a codex-lb turn ran very recently (fallback when no session/model in ctx). */
+	recentlyCodexLb?: () => boolean;
+	/** Max codex-lb search attempts before giving up. Default 3. */
 	maxAttempts?: number;
 }
 
@@ -67,9 +74,10 @@ let nativeToolCache: any | null | undefined;
 function getNativeWebSearchTool(): any | undefined {
 	if (nativeToolCache !== undefined) return nativeToolCache ?? undefined;
 	try {
-		// Lazy require so a missing/renamed internal never breaks loading our tool.
-		const mod = require("@oh-my-pi/pi-coding-agent/web/search/index");
-		const tools = typeof mod.getSearchTools === "function" ? mod.getSearchTools() : [];
+		// omp's web/search module is ESM — must use the static import, NOT require()
+		// (require returns no exports for it, which silently nulled the native tool and
+		// sent every non-codex-lb search to the codex-lb fallback).
+		const tools = typeof getSearchTools === "function" ? getSearchTools() : [];
 		nativeToolCache = tools.find((t: any) => t?.name === "web_search") ?? null;
 	} catch {
 		nativeToolCache = null;
@@ -100,11 +108,20 @@ export function createWebSearchTool(pi: Pi, config: WebSearchToolConfig, runtime
 	});
 	const maxAttempts = Math.max(1, runtime.maxAttempts ?? DEFAULT_MAX_ATTEMPTS);
 
-	// Runs one codex-lb web search over a FRESH session-keyed WS (codex-lb only
-	// works over the WebSocket transport). Throws on a transient/upstream failure
-	// so the caller can retry.
-	async function searchOnce(query: string, numSearchResults: number | undefined, signal: AbortSignal | undefined): Promise<SearchResponse> {
-		const sessionId = `websearch-${randomUUID()}`;
+	// Runs one codex-lb web search over the WebSocket transport (codex-lb only works
+	// over WS). REUSES the conversation's pooled socket (its session id) when known —
+	// opening a SEPARATE WS gets a brand-new upgrade, which codex-lb rejects whenever
+	// its new-connection path is degraded (502 → "Expected 101") even though the
+	// conversation's already-established socket still works. Falls back to a fresh
+	// ephemeral session otherwise. Throws on a transient/upstream failure so the
+	// caller can retry.
+	async function searchOnce(
+		query: string,
+		numSearchResults: number | undefined,
+		signal: AbortSignal | undefined,
+		conversationSession: string | undefined,
+	): Promise<SearchResponse> {
+		const sessionId = conversationSession ?? `websearch-${randomUUID()}`;
 		const wsFetch = runtime.pool.bind(sessionId, runtime.baseFetch);
 		try {
 			return await codexLbSearch(
@@ -112,13 +129,19 @@ export function createWebSearchTool(pi: Pi, config: WebSearchToolConfig, runtime
 				{ baseUrl: config.baseUrl, apiKey: config.apiKey, modelId: config.searchModel, searchContextSize: config.searchContextSize, fetchImpl: wsFetch },
 			);
 		} finally {
-			runtime.pool.remove(sessionId);
+			// Only drop sockets we created; the conversation owns (and reuses) its own.
+			if (!conversationSession) runtime.pool.remove(sessionId);
 		}
 	}
 
-	async function runCodexLb(query: string, numSearchResults: number | undefined, signal: AbortSignal | undefined) {
+	async function runCodexLb(
+		query: string,
+		numSearchResults: number | undefined,
+		signal: AbortSignal | undefined,
+		conversationSession: string | undefined,
+	) {
 		try {
-			const response = await retryAsync((attempt) => searchOnce(query, numSearchResults, signal), {
+			const response = await retryAsync((attempt) => searchOnce(query, numSearchResults, signal, conversationSession), {
 				maxAttempts,
 				isRetryable: (error) => !isAbortLike(error) && !isTimeoutLike(error),
 				onRetry: (attempt, error) => pi.logger?.warn?.(`codex-lb web_search attempt ${attempt}/${maxAttempts} failed, retrying: ${String(error)}`),
@@ -144,24 +167,29 @@ export function createWebSearchTool(pi: Pi, config: WebSearchToolConfig, runtime
 		approval: "read",
 
 		// Extension ToolDefinition.execute signature: (toolCallId, params, signal, onUpdate, ctx).
+		// omp's ctx carries { model, sessionId, signal, ... } — prefer ctx.sessionId so
+		// the search rides THIS turn's conversation socket; fall back to the provider's
+		// last-seen session, then a fresh ephemeral one.
 		async execute(toolCallId: string, params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any) {
-			const model = ctx?.model;
-			const isCodexLb = !model || model.provider === config.providerID;
+			const isCodexLb = isCodexLbTurn(ctx, config.providerID, runtime);
+			const conversationSession =
+				(typeof ctx?.sessionId === "string" && ctx.sessionId) || runtime.getSessionId?.() || undefined;
 			if (isCodexLb) {
-				return runCodexLb(params.query, params.num_search_results, signal);
+				return runCodexLb(params.query, params.num_search_results, signal, conversationSession);
 			}
-			// Non-codex-lb model: keep omp's native web search exactly as-is.
+			// NON-codex-lb turn (e.g. omp fell back to the built-in openai-codex): run
+			// omp's native web search UNCHANGED. The native tool is a CustomTool, whose
+			// execute order is (toolCallId, params, onUpdate, ctx, signal) — DIFFERENT
+			// from our extension ToolDefinition order (..., signal, onUpdate, ctx) — so
+			// we reorder when delegating (passing it straight through makes native read
+			// our onUpdate as its ctx → "ctx.sessionManager is undefined"). NEVER fall
+			// back to codex-lb here — that is exactly the hijack that broke openai-codex.
 			const native = getNativeWebSearchTool();
 			if (native?.execute) {
-				try {
-					// Native CustomTool.execute order: (toolCallId, params, onUpdate, ctx, signal).
-					return await native.execute(toolCallId, params, onUpdate, ctx, signal);
-				} catch (error) {
-					pi.logger?.warn?.("codex-lb: native web_search delegation failed", { error: String(error) });
-				}
+				return await native.execute(toolCallId, params, onUpdate, ctx, signal);
 			}
-			// Last resort: run codex-lb search so the model still gets web results.
-			return runCodexLb(params.query, params.num_search_results, signal);
+			pi.logger?.warn?.("codex-lb: native web_search tool not found; cannot delegate non-codex-lb search");
+			return errorResult("Error: web search is unavailable for this provider (native search tool not found).");
 		},
 
 		renderCall(args: any, options: any, theme: any) {
