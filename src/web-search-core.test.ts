@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { buildSearchBody, buildSearchHeaders, codexLbSearch, formatForLLM, parseSearchStream } from "./web-search-core";
+import { buildSearchBody, buildSearchHeaders, codexLbSearch, formatForLLM, parseSearchStream, retryAsync } from "./web-search-core";
+
+const noSleep = (_ms: number) => Promise.resolve();
 
 function sseResponse(frames: unknown[]): Response {
 	const enc = new TextEncoder();
@@ -124,6 +126,55 @@ describe("codexLbSearch end-to-end (fake fetch)", () => {
 			{ baseUrl: "https://lb.example/v1", apiKey: "k", modelId: "gpt-5.5", fetchImpl: async () => sseResponse(SEARCH_FRAMES) },
 		);
 		expect(resp.sources).toHaveLength(1);
+	});
+});
+
+describe("retryAsync (absorbs codex-lb transient 1011s)", () => {
+	test("returns the first success and stops calling", async () => {
+		let calls = 0;
+		const out = await retryAsync(async () => { calls++; return "ok"; }, { maxAttempts: 3, sleep: noSleep });
+		expect(out).toBe("ok");
+		expect(calls).toBe(1);
+	});
+
+	test("retries transient failures then succeeds, reporting each retry", async () => {
+		let calls = 0;
+		const retried: number[] = [];
+		const out = await retryAsync(
+			async () => { calls++; if (calls < 3) throw new Error("Upstream websocket closed before response.completed: received 1011"); return "answer"; },
+			{ maxAttempts: 3, sleep: noSleep, onRetry: (attempt) => retried.push(attempt) },
+		);
+		expect(out).toBe("answer");
+		expect(calls).toBe(3);
+		expect(retried).toEqual([1, 2]); // retried after attempts 1 and 2
+	});
+
+	test("re-throws the last error after exhausting attempts", async () => {
+		let calls = 0;
+		await expect(
+			retryAsync(async () => { calls++; throw new Error(`fail-${calls}`); }, { maxAttempts: 2, sleep: noSleep }),
+		).rejects.toThrow("fail-2");
+		expect(calls).toBe(2);
+	});
+
+	test("does NOT retry a non-retryable error (e.g. abort)", async () => {
+		let calls = 0;
+		await expect(
+			retryAsync(async () => { calls++; throw new DOMException("aborted", "AbortError"); }, {
+				maxAttempts: 4,
+				sleep: noSleep,
+				isRetryable: (e) => !(e instanceof DOMException && e.name === "AbortError"),
+			}),
+		).rejects.toThrow(/aborted/);
+		expect(calls).toBe(1);
+	});
+
+	test("throws AbortError without calling fn when the signal is already aborted", async () => {
+		let calls = 0;
+		await expect(
+			retryAsync(async () => { calls++; return "x"; }, { maxAttempts: 3, sleep: noSleep, signal: AbortSignal.abort() }),
+		).rejects.toThrow(/abort/i);
+		expect(calls).toBe(0);
 	});
 });
 

@@ -61,7 +61,11 @@ export const WEB_SEARCH_TOOL_DESCRIPTION = `Searches the web for up-to-date info
 - You MUST include links for cited sources in the final response
 </instruction>`;
 
-const SEARCH_HARD_TIMEOUT_MS = 60_000;
+// omp's native codex search uses a 60s hard timeout against chatgpt.com directly.
+// codex-lb proxies to upstream accounts and is materially slower — a thorough
+// `search_context_size: high` query has been measured at ~90s end-to-end — so 60s
+// guarantees spurious timeouts. Give codex-lb a much longer budget.
+export const SEARCH_HARD_TIMEOUT_MS = 180_000;
 
 export function withHardTimeout(signal: AbortSignal | undefined, ms: number = SEARCH_HARD_TIMEOUT_MS): AbortSignal {
 	const timeout = AbortSignal.timeout(ms);
@@ -291,6 +295,8 @@ export interface CodexLbSearchConfig {
 	modelId: string;
 	searchContextSize?: "low" | "medium" | "high";
 	fetchImpl?: (input: any, init?: any) => Promise<Response>;
+	/** Hard timeout for the whole search request (ms). Defaults to SEARCH_HARD_TIMEOUT_MS. */
+	timeoutMs?: number;
 }
 
 // Runs one codex-lb web search and returns a SearchResponse (same shape omp's
@@ -311,7 +317,7 @@ export async function codexLbSearch(
 		method: "POST",
 		headers: buildSearchHeaders(config.apiKey),
 		body: JSON.stringify(body),
-		signal: withHardTimeout(params.signal),
+		signal: withHardTimeout(params.signal, config.timeoutMs),
 	});
 	if (!response.ok) {
 		const text = await response.text().catch(() => "");
@@ -375,4 +381,49 @@ export function formatForLLM(response: SearchResponse): string {
 
 export function hasRenderableSearchContent(response: SearchResponse): boolean {
 	return Boolean((response.answer && response.answer.length > 0) || response.sources.length > 0);
+}
+
+// ── transient-failure retry ───────────────────────────────────────────────────
+//
+// codex-lb's upstream returns transient 1011 "internal error" closes even for
+// valid requests; the chat path survives these via omp's turn replay. A one-shot
+// web search has no such loop, so it retries here. Generic + sleep-injectable so
+// it stays unit-testable.
+
+export interface RetryOptions {
+	maxAttempts?: number;
+	isRetryable?: (error: unknown) => boolean;
+	onRetry?: (attempt: number, error: unknown) => void;
+	delayMs?: (attempt: number) => number;
+	sleep?: (ms: number) => Promise<void>;
+	signal?: AbortSignal;
+}
+
+function defaultSleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Runs `fn` up to `maxAttempts` times, retrying while `isRetryable(error)` holds
+ * (default: always). Re-throws the last error when attempts are exhausted or the
+ * error is non-retryable, and throws an AbortError if `signal` is aborted.
+ */
+export async function retryAsync<T>(fn: (attempt: number) => Promise<T>, options: RetryOptions = {}): Promise<T> {
+	const maxAttempts = Math.max(1, options.maxAttempts ?? 3);
+	const isRetryable = options.isRetryable ?? (() => true);
+	const sleep = options.sleep ?? defaultSleep;
+	let lastError: unknown;
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		if (options.signal?.aborted) throw new DOMException("The operation was aborted.", "AbortError");
+		try {
+			return await fn(attempt);
+		} catch (error) {
+			lastError = error;
+			if (attempt === maxAttempts || !isRetryable(error)) throw error;
+			options.onRetry?.(attempt, error);
+			const ms = options.delayMs ? options.delayMs(attempt) : 0;
+			if (ms > 0) await sleep(ms);
+		}
+	}
+	throw lastError;
 }

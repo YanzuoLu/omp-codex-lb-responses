@@ -34,10 +34,10 @@ provider-scoped `fetch`. Nothing global is patched.
 ## Install
 
 ```bash
-omp plugin install github:YanzuoLu/omp-codex-lb-responses#v0.19.0
+omp plugin install github:YanzuoLu/omp-codex-lb-responses#v0.19.1
 ```
 
-Pin a **version tag** (`#v0.19.0`), not a commit SHA, so upgrades are a one-line
+Pin a **version tag** (`#v0.19.1`), not a commit SHA, so upgrades are a one-line
 bump. There is **no patcher step** and nothing to re-apply after `omp update`.
 
 ## Configure
@@ -94,6 +94,10 @@ global monkeypatch**:
   (`stream`, `store:false`, the `web_search` tool with `search_context_size`,
   `tool_choice`, and omp's own search system prompt); only the URL (→ codex-lb)
   and auth (→ your `sk-clb-…` Bearer, no `chatgpt-account-id`) differ.
+- It runs over codex-lb's **WebSocket** transport (the same session-keyed pool the
+  provider uses), not plain HTTP — codex-lb's HTTP `/responses` is non-functional.
+  Transient upstream `1011` closes are **retried** (a fresh socket per attempt), so
+  a single flaky turn no longer surfaces as a hard failure.
 - Results render through **omp's own exported Search card** (answer + clickable
   sources), so the UI is the native one.
 - It **overrides omp's built-in `web_search`**: on codex-lb turns the search goes
@@ -133,7 +137,9 @@ For hosted-tool search without the card, use `webSearch: inject` instead.
 - **Web search** (`webSearch: card`, `src/web-search.ts` + `src/web-search-core.ts`):
   a plugin-registered `web_search` tool that replicates omp's native codex search
   request to codex-lb and renders results through omp's own exported card renderer.
-  No source patch, no global monkeypatch. See [Web search](#web-search).
+  It runs over the **same session-keyed WebSocket pool** as the provider (codex-lb's
+  HTTP `/responses` is non-functional) and **retries** transient upstream `1011`
+  closes. No source patch, no global monkeypatch. See [Web search](#web-search).
 - **No globals patched, no source patched.** The fetch override is per-provider and
   the auth is a plain key. The one omp behavior still hardcoded to the built-in
   `openai-codex` provider — remote compaction — is intentionally **not** used.

@@ -1,6 +1,6 @@
 {
   "name": "omp-codex-lb-responses",
-  "version": "0.19.0",
+  "version": "0.19.1",
   "type": "module",
   "private": false,
   "description": "OMP plugin: a clean codex-lb provider that routes the OpenAI Responses API over codex-lb's WebSocket transport — no source patcher, no global monkeypatch, no synthetic JWT.",

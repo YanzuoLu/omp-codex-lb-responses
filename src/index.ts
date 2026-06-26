@@ -237,7 +237,13 @@ export interface ActivateDeps {
 	WebSocketImpl?: unknown;
 	createPool?: typeof createWebSocketFetch;
 	/** Registrar for the `card`-mode web_search tool, imported lazily by the default export. */
-	webSearchRegistrar?: (pi: ExtensionApi, config: WebSearchToolConfig) => void;
+	webSearchRegistrar?: (pi: ExtensionApi, config: WebSearchToolConfig, runtime: WebSearchRuntime) => void;
+}
+
+/** Runtime the card-mode web_search needs from the provider: the WS pool + a base fetch. */
+export interface WebSearchRuntime {
+	pool: WebSocketFetch;
+	baseFetch: FetchLike;
 }
 
 export function activate(pi: ExtensionApi, deps: ActivateDeps = {}): WebSocketFetch | undefined {
@@ -276,13 +282,20 @@ export function activate(pi: ExtensionApi, deps: ActivateDeps = {}): WebSocketFe
 	// the native codex search request + card (registrar imported lazily upstream).
 	if (config.webSearch === "card" && deps.webSearchRegistrar) {
 		try {
-			deps.webSearchRegistrar(pi, {
-				providerID: config.providerID,
-				baseUrl: config.baseUrl,
-				apiKey: config.apiKey,
-				searchModel: config.searchModel,
-				searchContextSize: "high",
-			});
+			deps.webSearchRegistrar(
+				pi,
+				{
+					providerID: config.providerID,
+					baseUrl: config.baseUrl,
+					apiKey: config.apiKey,
+					searchModel: config.searchModel,
+					searchContextSize: "high",
+				},
+				// codex-lb's HTTP /responses is non-functional; the search must ride the
+				// SAME WebSocket pool the provider uses. Reusing this pool also normalizes
+				// headers (lowercasing the beta header) so the WS upgrade succeeds.
+				{ pool, baseFetch: (globalThis.fetch as unknown) as FetchLike },
+			);
 		} catch (error) {
 			pi.logger?.warn?.(`${SERVICE}: failed to register codex-lb web_search tool: ${String(error)}`);
 		}

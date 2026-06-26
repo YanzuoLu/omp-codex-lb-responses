@@ -82,7 +82,16 @@ export function connectResponsesWebSocket({
 			reject(abortError(signal));
 			return;
 		}
-		const finalHeaders: Record<string, string> = { ...headers };
+		// Lowercase all header keys up front. HTTP header names are case-insensitive,
+		// but the beta rewrite below (and the delete-list) look keys up by their
+		// lowercase form. A caller that passes `OpenAI-Beta` (mixed case) without
+		// going through normalizeHeaders would otherwise slip past the rewrite, and
+		// the `else if (!beta)` branch would ADD a second, conflicting `openai-beta`
+		// header — codex-lb then closes the upstream with 1011. Normalizing here makes
+		// the transform reliable for every caller (the pool already lowercases; a
+		// direct caller like the web_search transport now gets the same guarantee).
+		const finalHeaders: Record<string, string> = {};
+		for (const [key, value] of Object.entries(headers)) finalHeaders[key.toLowerCase()] = value;
 		// codex-lb upgrades a Responses request to a websocket via this beta header.
 		const beta = finalHeaders["openai-beta"];
 		if (beta && /responses=/.test(beta)) {

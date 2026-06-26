@@ -85,6 +85,37 @@ describe("connectResponsesWebSocket", () => {
 		ws.fireOpen();
 		await expect(p).resolves.toBe(ws as unknown as WebSocketLike);
 	});
+
+	test("normalizes mixed-case header keys so the beta rewrite never emits a duplicate (root cause of upstream 1011)", async () => {
+		MockWebSocket.instances = [];
+		// Headers that bypass normalizeHeaders (e.g. buildSearchHeaders) arrive mixed-case.
+		const p = connectResponsesWebSocket({
+			url: "https://lb.example/v1/responses",
+			headers: {
+				Authorization: "Bearer sk-real",
+				"OpenAI-Beta": "responses=experimental",
+				originator: "pi",
+				Accept: "text/event-stream",
+				"Content-Type": "application/json",
+			},
+			WebSocketImpl: MockWebSocket as unknown as typeof MockWebSocket & (new (u: string, o?: any) => WebSocketLike),
+		});
+		const ws = MockWebSocket.instances[0]!;
+		const headers = ws.options?.headers ?? {};
+		// Exactly one beta header, under the lowercase key, carrying the websocket protocol —
+		// NOT the experimental value, and NOT a mixed-case duplicate.
+		const betaKeys = Object.keys(headers).filter((k) => k.toLowerCase() === "openai-beta");
+		expect(betaKeys).toEqual(["openai-beta"]);
+		expect(headers["openai-beta"]).toBe("responses_websockets=2026-02-06");
+		expect(headers["OpenAI-Beta"]).toBeUndefined();
+		expect(Object.values(headers)).not.toContain("responses=experimental");
+		// Auth preserved (lowercased key); content-type/accept stripped for the upgrade.
+		expect(headers["authorization"]).toBe("Bearer sk-real");
+		expect(headers["content-type"]).toBeUndefined();
+		expect(headers["accept"]).toBeUndefined();
+		ws.fireOpen();
+		await p;
+	});
 });
 
 describe("streamResponsesWebSocket", () => {
