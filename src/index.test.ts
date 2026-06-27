@@ -48,6 +48,14 @@ describe("readConfig", () => {
 		expect(c2.searchModel).toBe("gpt-5.4");
 	});
 
+	test("parses webSearchForce (default false; true for true/on/1/all)", () => {
+		expect(readConfig({ apiKey: "k", baseUrl: BASE })!.webSearchForce).toBe(false);
+		expect(readConfig({ apiKey: "k", baseUrl: BASE, webSearchForce: "true" })!.webSearchForce).toBe(true);
+		expect(readConfig({ apiKey: "k", baseUrl: BASE, webSearchForce: "on" })!.webSearchForce).toBe(true);
+		expect(readConfig({ apiKey: "k", baseUrl: BASE, webSearchForce: "all" })!.webSearchForce).toBe(true);
+		expect(readConfig({ apiKey: "k", baseUrl: BASE, webSearchForce: "off" })!.webSearchForce).toBe(false);
+	});
+
 	test("mode defaults to on, parses off, and accepts the codex-lb alias", () => {
 		expect(readConfig({ apiKey: "k", baseUrl: BASE })!.mode).toBe("on");
 		expect(readConfig({ apiKey: "k", baseUrl: BASE, mode: "off" })!.mode).toBe("off");
@@ -129,6 +137,26 @@ describe("activate", () => {
 		);
 		expect(bridges[0].port).toBe(9123);
 		pool?.close();
+	});
+
+	test("forwards force to the web_search registrar (default false, true when webSearchForce set)", () => {
+		const run = (env: Record<string, string>) => {
+			const bridges: any[] = [];
+			let wsConfig: any;
+			const pool = activate(
+				{ registerProvider: () => {} },
+				{
+					env: { CODEX_LB_API_KEY: "k", CODEX_LB_BASE_URL: BASE, CODEX_LB_WEB_SEARCH: "card", ...env },
+					WebSocketImpl: class {},
+					startBridge: fakeBridge(bridges),
+					webSearchRegistrar: (_pi: any, cfg: any) => { wsConfig = cfg; },
+				},
+			);
+			pool?.close();
+			return wsConfig;
+		};
+		expect(run({}).force).toBe(false);
+		expect(run({ CODEX_LB_WEB_SEARCH_FORCE: "true" }).force).toBe(true);
 	});
 });
 

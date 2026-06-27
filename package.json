@@ -1,6 +1,6 @@
 {
   "name": "omp-codex-lb-responses",
-  "version": "0.21.0",
+  "version": "0.22.0",
   "type": "module",
   "private": false,
   "description": "OMP plugin: a clean codex-lb provider that routes the OpenAI Responses API over codex-lb's WebSocket transport — no source patcher, no global monkeypatch, no synthetic JWT.",
@@ -56,6 +56,11 @@
         "type": "string",
         "description": "Model used for `webSearch: card` search requests (defaults to your first model, e.g. gpt-5.5).",
         "env": "CODEX_LB_WEB_SEARCH_MODEL"
+      },
+      "webSearchForce": {
+        "type": "string",
+        "description": "When set (true/on/1/all), `webSearch: card` routes EVERY web_search to codex-lb — even on non-codex-lb turns (e.g. anthropic/openai-codex), with no native delegation. Requires mode=on. Default off (route by the turn's provider).",
+        "env": "CODEX_LB_WEB_SEARCH_FORCE"
       }
     }
   },

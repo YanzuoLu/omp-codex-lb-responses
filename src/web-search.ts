@@ -40,6 +40,8 @@ export interface WebSearchToolConfig {
 	apiKey: string;
 	searchModel: string;
 	searchContextSize?: "low" | "medium" | "high";
+	/** Force EVERY web_search to codex-lb, even on non-codex-lb turns (no native delegation). */
+	force?: boolean;
 }
 
 /** Runtime wiring the search needs from the provider: the WS pool + a base fetch. */
@@ -171,7 +173,10 @@ export function createWebSearchTool(pi: Pi, config: WebSearchToolConfig, runtime
 		// the search rides THIS turn's conversation socket; fall back to the provider's
 		// last-seen session, then a fresh ephemeral one.
 		async execute(toolCallId: string, params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any) {
-			const isCodexLb = isCodexLbTurn(ctx, config.providerID, runtime);
+			// `force` (webSearchForce): always route to codex-lb regardless of the turn's
+			// model — opt-in global override (no native delegation). Otherwise route by
+			// the turn's provider: codex-lb turn → codex-lb, everything else → native.
+			const isCodexLb = config.force === true || isCodexLbTurn(ctx, config.providerID, runtime);
 			const conversationSession =
 				(typeof ctx?.sessionId === "string" && ctx.sessionId) || runtime.getSessionId?.() || undefined;
 			if (isCodexLb) {
@@ -204,5 +209,9 @@ export function createWebSearchTool(pi: Pi, config: WebSearchToolConfig, runtime
 /** Registers the codex-lb web_search tool on the extension. */
 export function registerCodexLbWebSearch(pi: Pi, config: WebSearchToolConfig, runtime: WebSearchRuntime): void {
 	pi.registerTool(createWebSearchTool(pi, config, runtime));
-	pi.logger?.info?.(`omp-codex-lb-responses: registered codex-lb web_search over WebSocket (overrides native for ${config.providerID} turns)`);
+	pi.logger?.info?.(
+		config.force
+			? `omp-codex-lb-responses: registered codex-lb web_search over WebSocket (FORCED for ALL turns — no native delegation)`
+			: `omp-codex-lb-responses: registered codex-lb web_search over WebSocket (overrides native for ${config.providerID} turns)`,
+	);
 }

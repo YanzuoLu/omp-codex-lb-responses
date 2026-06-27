@@ -52,6 +52,7 @@ export interface CodexLbConfig {
 	models: ModelEntry[];
 	webSearch: WebSearchMode;
 	searchModel: string;
+	webSearchForce: boolean;
 	mode: PluginMode;
 	bridgePort: number;
 }
@@ -138,12 +139,14 @@ export function readConfig(settings: Settings = {}, env: Record<string, string |
 				? "card"
 				: "off";
 	const searchModel = pickString(settings, "searchModel", env, "CODEX_LB_WEB_SEARCH_MODEL") ?? models[0]?.id ?? "gpt-5.5";
+	const forceRaw = (pickString(settings, "webSearchForce", env, "CODEX_LB_WEB_SEARCH_FORCE") ?? "").toLowerCase();
+	const webSearchForce = forceRaw === "true" || forceRaw === "1" || forceRaw === "on" || forceRaw === "yes" || forceRaw === "all";
 	const modeRaw = (pickString(settings, "mode", env, "CODEX_LB_MODE") ?? "on").toLowerCase();
 	const mode: PluginMode = modeRaw === "off" || modeRaw === "native" || modeRaw === "false" ? "off" : "on";
 	const portRaw = pickString(settings, "bridgePort", env, "CODEX_LB_BRIDGE_PORT");
 	const portNum = portRaw ? Number(portRaw) : NaN;
 	const bridgePort = Number.isInteger(portNum) && portNum > 0 && portNum < 65536 ? portNum : DEFAULT_BRIDGE_PORT;
-	return { providerID, baseUrl, apiKey, models, webSearch, searchModel, mode, bridgePort };
+	return { providerID, baseUrl, apiKey, models, webSearch, searchModel, webSearchForce, mode, bridgePort };
 }
 
 /**
@@ -342,6 +345,7 @@ export function activate(pi: ExtensionApi, deps: ActivateDeps = {}): WebSocketFe
 					apiKey: config.apiKey,
 					searchModel: config.searchModel,
 					searchContextSize: "high",
+					force: config.webSearchForce,
 				},
 				// codex-lb's HTTP /responses is non-functional; the search must ride the
 				// SAME WebSocket pool the provider uses. Reusing this pool also normalizes

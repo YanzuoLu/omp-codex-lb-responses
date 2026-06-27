@@ -38,10 +38,10 @@ provider-scoped `fetch`. Nothing global is patched.
 ## Install
 
 ```bash
-omp plugin install github:YanzuoLu/omp-codex-lb-responses#v0.21.0
+omp plugin install github:YanzuoLu/omp-codex-lb-responses#v0.22.0
 ```
 
-Pin a **version tag** (`#v0.21.0`), not a commit SHA, so upgrades are a one-line
+Pin a **version tag** (`#v0.22.0`), not a commit SHA, so upgrades are a one-line
 bump. There is **no patcher step** and nothing to re-apply after `omp update`.
 
 ## Configure
@@ -67,6 +67,7 @@ omp plugin config set omp-codex-lb-responses mode    on   # or `off`
 | `models` | no | built-in catalog | `CODEX_LB_MODELS` | Comma-separated model ids served by the bridge's `/models`. |
 | `webSearch` | no | off | `CODEX_LB_WEB_SEARCH` | `card` = native-identical codex web search with the full Search card (see [Web search](#web-search)); `inject` = hosted tool per turn, no card. |
 | `searchModel` | no | first model | `CODEX_LB_WEB_SEARCH_MODEL` | Model used for `webSearch: card` search requests (e.g. `gpt-5.5`). |
+| `webSearchForce` | no | off | `CODEX_LB_WEB_SEARCH_FORCE` | When set (`true`/`on`/`all`), `webSearch: card` routes **every** `web_search` to codex-lb — even on non-codex-lb turns (anthropic/openai-codex/…), with no native fallback. Requires `mode: on`. |
 
 Each setting also reads from its env var (plugin config wins), so you can keep the
 secret out of the config file entirely:
@@ -142,6 +143,15 @@ global monkeypatch**:
   to codex-lb; on other models it transparently delegates to omp's native search.
   So when you're on a `codex-lb/<model>`, the official-ChatGPT codex search (which
   you have no OAuth for) is effectively replaced by codex-lb's.
+
+**Force all search to codex-lb** (`webSearchForce`): by default routing is per-turn
+— only `codex-lb/*` turns search via codex-lb, everything else delegates to native.
+Set `omp plugin config set omp-codex-lb-responses webSearchForce true` to route
+**every** `web_search` to codex-lb regardless of the turn's model (e.g. you chat on
+`anthropic/opus` but want all web search billed to and served by your codex-lb
+account, with no ChatGPT OAuth needed). Trade-off: there is **no native fallback** —
+if codex-lb is down or `mode: off`, web search fails for all models. Restart omp
+after changing.
 
 `searchModel` picks the model for the search request (default: your first model).
 For hosted-tool search without the card, use `webSearch: inject` instead.
